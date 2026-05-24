@@ -1,0 +1,16 @@
+# Example dataset config for YOLOv8 parking-space detection.
+# Copy this file and update paths/classes to match your dataset.
+
+path: ../dataset/parking_slots
+train: images/train
+val: images/val
+
+# If available, add a dedicated test split.
+# test: images/test
+
+# Two-class example:
+# 0 = empty slot
+# 1 = occupied slot
+names:
+  0: empty
+  1: occupied

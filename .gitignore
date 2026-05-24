@@ -1,0 +1,125 @@
+# ===== Flutter / Dart =====
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+pubspec.lock
+.pub/
+.metadata
+
+# Flutter build outputs
+build/
+.gradle/
+
+# iOS
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+ios/Flutter/ephemeral/
+ios/Pods/
+ios/Podfile.lock
+ios/Runner/GeneratedPluginRegistrant.*
+ios/.symlinks/
+ios/*.mode1v3
+ios/*.mode2v3
+ios/*.moved-aside
+ios/*.pbxuser
+ios/*.perspectivev3
+ios/**/xcuserdata/
+ios/**/xcworkspace/xcuserdata/
+
+# Android
+android/.gradle/
+android/gradle/
+android/app/build/
+android/local.properties
+
+# macOS
+macos/Flutter/Flutter-Release.xcconfig
+macos/Pods/
+macos/Podfile.lock
+macos/**/xcuserdata/
+
+# Linux/Windows
+linux/flutter/generated_plugins.cmake
+windows/flutter/generated_plugins.cmake
+
+# ===== IDE & Editor =====
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# ===== OS & System =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Python Backend =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+backend/lib/
+backend/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-selfcheck.json
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ===== Machine Learning / Models =====
+*.pt
+*.pth
+*.h5
+*.pkl
+*.joblib
+*.onnx
+yolov8n.pt
+
+# Training outputs and runs
+backend/runs/
+runs/
+lightning_logs/
+
+# Datasets
+backend/dataset/archive/
+backend/dataset/CNR-EXT-Patches-150x150/
+
+# ===== Environment & Secrets =====
+.env
+.env.local
+.env.*.local
+local.properties
+
+# ===== Logs & Temporary =====
+*.log
+*.tmp
+*.temp
+*.bak
+.cache/
+
+# ===== Node (if applicable) =====
+node_modules/
+npm-debug.log
+yarn-error.log

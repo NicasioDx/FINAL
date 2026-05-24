@@ -1,0 +1,252 @@
+==========================================================
+   HOWTO: ติดตั้งและรัน Parking AI (เวอร์ชันปัจจุบัน)
+==========================================================
+
+เอกสารนี้อัปเดตให้ตรงกับโค้ดล่าสุดของโปรเจกต์
+
+==========================================================
+   0) สิ่งที่ต้องมี
+==========================================================
+
+1. Windows 10/11 (คู่มือนี้ใช้ PowerShell)
+2. Python 3.10+
+3. Flutter SDK
+4. Docker Desktop (ถ้าจะใช้ฐานข้อมูลด้วย Docker)
+
+ตรวจสอบคำสั่ง:
+- python --version
+- flutter doctor
+- docker --version
+
+==========================================================
+   1) วิธีเร็วสุด: ใช้สคริปต์ setup เครื่องใหม่
+==========================================================
+
+เปิด PowerShell ที่โฟลเดอร์ PJM แล้วรัน:
+
+  .\setup_new_machine.ps1
+
+สคริปต์จะทำให้:
+- สร้าง backend venv
+- ติดตั้ง pip packages ตาม requirements.txt
+- สร้าง backend/.env (ถ้ายังไม่มี)
+- สตาร์ต database ผ่าน docker compose (ถ้าไม่ skip)
+- flutter pub get
+
+ตัวเลือก:
+- .\setup_new_machine.ps1 -SkipDocker
+- .\setup_new_machine.ps1 -StartBackend
+- .\setup_new_machine.ps1 -StartFrontend
+
+==========================================================
+   2) วิธี manual (ถ้าต้องการควบคุมทีละขั้น)
+==========================================================
+
+2.1 Backend
+
+  cd backend
+  python -m venv venv
+  .\venv\Scripts\activate
+  pip install -r requirements.txt
+  python main.py
+
+Backend URL:
+- http://localhost:8000
+
+2.2 Frontend (Flutter Web)
+
+  cd parking_web
+  flutter pub get
+  flutter run -d chrome
+
+==========================================================
+   3) Environment ที่ต้องรู้
+==========================================================
+
+ไฟล์ backend/.env ตัวอย่าง:
+
+  DATABASE_URL=postgresql://postgres:1234@localhost:5432/parking_db
+  CAMERA_CREDENTIAL_KEY=<fernet_key>
+
+หมายเหตุสำคัญ:
+- CAMERA_CREDENTIAL_KEY ต้องคงที่ใน production
+- เปลี่ยน key ภายหลังอาจทำให้ถอดรหัสรหัสผ่านกล้องเดิมไม่ได้
+
+==========================================================
+   4) Docker Compose
+==========================================================
+
+รันระบบ backend + database:
+
+  docker compose up -d
+
+ดูสถานะ:
+
+  docker compose ps
+  docker compose logs -f
+
+หยุด:
+
+  docker compose down
+
+==========================================================
+   5) ฟีเจอร์และพฤติกรรมปัจจุบัน
+==========================================================
+
+1. Auth
+- สมัครสมาชิกและล็อกอินได้
+- รหัสผ่านผู้ใช้เก็บแบบ bcrypt
+- ผู้ใช้เก่า SHA-256 จะถูกอัปเกรดเป็น bcrypt ตอนล็อกอินสำเร็จ
+
+2. Camera security
+- รหัสผ่านกล้องเข้ารหัสก่อนเก็บใน DB
+- API รายการกล้องไม่ส่ง credential ไป frontend
+- live stream ใช้ camera_id แล้ว backend ดึง credential เอง
+
+3. Streaming
+- WebSocket /ws/live สำหรับหน้าดูกล้อง
+- WebSocket /ws/preview_camera สำหรับหน้าทดสอบกล้องก่อนบันทึก
+
+4. Frontend
+- มี dark mode (สลับและจำค่าได้)
+- หน้าดูกล้องมีปุ่ม fullscreen
+- หน้าที่สำคัญต้องล็อกอินก่อน (route guard)
+
+==========================================================
+   6) API สรุป
+==========================================================
+
+Auth
+- POST /register
+- POST /login
+
+Camera
+- GET /get_cameras
+- POST /add_camera
+
+Streaming
+- WS /ws/live (payload: camera_id)
+- WS /ws/preview_camera
+
+System
+- GET /health
+- GET /ping
+
+==========================================================
+   7) Troubleshooting
+==========================================================
+
+1. uvicorn main:app แล้ว error Could not import module "main"
+- ให้ cd เข้า backend ก่อน
+- หรือใช้ --app-dir ให้ถูกต้อง
+
+2. WebSocket 403 ผ่าน ngrok
+- restart backend ให้เป็นโค้ดล่าสุด
+- เช็ก BASE_URL ฝั่ง Flutter ให้ตรงโดเมน ngrok ปัจจุบัน
+- full restart แอป (ไม่ใช่แค่ hot reload)
+
+3. frontend build ไม่ผ่าน
+- flutter clean
+- flutter pub get
+- flutter build web
+
+4. เข้าหน้า /add หรือ /list ได้ทั้งที่ยังไม่ล็อกอิน
+- เช็กว่าใช้ build ล่าสุดที่มี route guard แล้ว
+- clear browser storage แล้วลองใหม่
+
+==========================================================
+   8) ลำดับใช้งานจริง
+==========================================================
+
+1. สตาร์ต backend และ frontend
+2. สมัครสมาชิก
+3. ล็อกอิน
+4. เพิ่มกล้อง (ลอง preview ก่อน)
+5. บันทึกกล้อง
+6. เข้าหน้าดูกล้องแบบ live
+
+==========================================================
+    9) เทรน AI สำหรับจับสถานะที่จอดรถ (YOLOv8)
+==========================================================
+
+ไฟล์ที่เพิ่มให้แล้ว:
+- backend/train_parking_ai.py
+- backend/parking_slots_example.yaml
+
+9.1 โครงสร้าง dataset (YOLO format)
+
+   dataset/parking_slots/
+      images/
+         train/
+         val/
+      labels/
+         train/
+         val/
+
+หมายเหตุ label แต่ละบรรทัด:
+   class_id x_center y_center width height
+ค่าพิกัดต้อง normalize เป็นช่วง 0..1
+
+9.2 ตัวอย่างคลาส
+- 0 = empty (ช่องว่าง)
+- 1 = occupied (มีรถจอด)
+
+9.3 ตั้งค่า dataset yaml
+
+คัดลอกไฟล์ตัวอย่าง:
+   backend/parking_slots_example.yaml
+
+แล้วแก้ path ให้ชี้ไป dataset จริงของคุณ
+
+9.4 คำสั่งเทรน
+
+   cd backend
+   .\venv\Scripts\activate
+   python train_parking_ai.py --data parking_slots_example.yaml --model yolov8n.pt --epochs 100 --imgsz 1280 --batch 8
+
+ไฟล์โมเดลที่ได้จะอยู่ใต้โฟลเดอร์:
+   backend/runs/parking/yolov8_parking/weights/best.pt
+
+9.5 ทิปส์ให้แม่นขึ้นสำหรับมุมกล้องที่จอดรถ
+- เก็บภาพหลายช่วงเวลา: เช้า/บ่าย/เย็น/ฝนตก
+- มีทั้งเงาแรงและแสงจ้า
+- ใส่ภาพที่มีรถจอดทับเส้น/จอดเอียง
+- ให้สัดส่วน empty:occupied สมดุล
+- อย่างน้อย 500-1000 ภาพที่ annotate ดี จะเริ่มเห็นผลชัด
+
+9.6 กรณีโหลด PKLot + CNRPark มาแล้ว (แนะนำเริ่มแบบ Classification)
+
+ไฟล์ที่ใช้:
+- backend/prepare_pklot_cnrpark_cls.py
+- backend/train_parking_cls.py
+
+ขั้นตอน:
+
+1) รวม dataset เป็น format ที่เทรนได้ทันที
+
+   cd backend
+   .\venv\Scripts\activate
+   python prepare_pklot_cnrpark_cls.py --sources "D:\datasets\PKLot" "D:\datasets\CNRPark" --output "..\dataset\parking_cls"
+
+หลังรันเสร็จจะได้โครงสร้าง:
+   dataset/parking_cls/
+      train/empty
+      train/occupied
+      val/empty
+      val/occupied
+
+2) เทรนโมเดล classify ช่องจอด (empty/occupied)
+
+   python train_parking_cls.py --data "..\dataset\parking_cls" --model yolov8n-cls.pt --epochs 50 --imgsz 224 --batch 64
+
+3) ทดสอบโมเดลกับรูปใหม่
+
+   yolo task=classify mode=predict model=runs/parking_cls/yolov8_parking_cls/weights/best.pt source="D:\test_parking_images" save=True
+
+หมายเหตุสำคัญ:
+- PKLot/CNRPark ส่วนใหญ่เป็นภาพ crop ของ "ช่องจอดเดี่ยว" จึงเหมาะกับ classification
+- ถ้าจะใช้กับภาพมุมกว้างทั้งลานจอด ให้กำหนด ROI ของแต่ละช่องก่อน แล้วค่อยส่ง crop แต่ละช่องเข้า classifier
+
+==========================================================
+   End
+==========================================================
