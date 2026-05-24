@@ -1,9 +1,12 @@
-import os
-# ✅ บรรทัดที่สำคัญที่สุด: ต้องอยู่ก่อน import torch หรือ ultralytics
+﻿import os
+# âœ… à¸šà¸£à¸£à¸—à¸±à¸”à¸—à¸µà¹ˆà¸ªà¸³à¸„à¸±à¸à¸—à¸µà¹ˆà¸ªà¸¸à¸”: à¸•à¹‰à¸­à¸‡à¸­à¸¢à¸¹à¹ˆà¸à¹ˆà¸­à¸™ import torch à¸«à¸£à¸·à¸­ ultralytics
 os.environ["TORCH_FORCE_WEIGHTS_ONLY_LOAD"] = "0"
-
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 import cv2
 import base64
+import json
+import numpy as np
 import threading
 import time
 import logging
@@ -15,14 +18,14 @@ from contextlib import asynccontextmanager
 torch.load = functools.partial(torch.load, weights_only=False)
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 import uvicorn
 from ultralytics import YOLO 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer
 
-# นำเข้าฟังก์ชันจาก database.py
+# à¸™à¸³à¹€à¸‚à¹‰à¸²à¸Ÿà¸±à¸‡à¸à¹Œà¸Šà¸±à¸™à¸ˆà¸²à¸ database.py
 from database import (
     init_db, add_camera_to_db, get_all_cameras, create_user, authenticate_user,
     get_connection, release_connection, get_camera_credentials,
@@ -32,43 +35,555 @@ from database import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("parking_backend")
 
+# --- Demo video mode ---------------------------------------------------------
+# à¹ƒà¸Šà¹‰à¸ªà¸³à¸«à¸£à¸±à¸šà¹€à¸”à¹‚à¸¡à¹à¸—à¸™à¸à¸¥à¹‰à¸­à¸‡à¸ˆà¸£à¸´à¸‡: à¸•à¸±à¹‰à¸‡ USE_DEMO_VIDEO=true à¹à¸¥à¹‰à¸§à¸§à¸²à¸‡à¸§à¸´à¸”à¸µà¹‚à¸­à¹„à¸§à¹‰à¸—à¸µà¹ˆ DEMO_VIDEO_PATH
+TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+
+
+def env_value(name: str, default: str) -> str:
+    return os.getenv(name) or os.getenv(f"\ufeff{name}") or default
+
+
+USE_DEMO_VIDEO = env_value("USE_DEMO_VIDEO", "false").strip().lower() in TRUE_VALUES
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+AI_DEVICE = env_value("AI_DEVICE", "auto").strip().lower()
+DEMO_VIDEO_PATH = env_value("DEMO_VIDEO_PATH", "videos/demo_parking.mp4")
+USE_AUTO_SLOT = env_value("USE_AUTO_SLOT", "true").strip().lower() in TRUE_VALUES
+USE_MANUAL_ROI_FALLBACK = env_value("USE_MANUAL_ROI_FALLBACK", "true").strip().lower() in TRUE_VALUES
+SLOT_MODEL_PATH = env_value("SLOT_MODEL_PATH", "best.pt")
+VEHICLE_MODEL_PATH = env_value("VEHICLE_MODEL_PATH", "yolov8s.pt")
+MANUAL_ROI_PATH = env_value("MANUAL_ROI_PATH", "manual_rois.json")
+SLOT_CONF = float(env_value("SLOT_CONF", "0.25"))
+SLOT_IOU = float(env_value("SLOT_IOU", "0.30"))
+SLOT_IMGSZ = int(env_value("SLOT_IMGSZ", "640"))
+SLOT_MAX_COUNT = int(env_value("SLOT_MAX_COUNT", "0"))
+VEHICLE_CONF = float(env_value("VEHICLE_CONF", "0.25"))
+DRAW_VEHICLE_BOXES = env_value("DRAW_VEHICLE_BOXES", "false").strip().lower() in TRUE_VALUES
+OCCUPIED_THRESHOLD = float(env_value("OCCUPIED_THRESHOLD", "0.70"))
+OCCUPIED_SLOT_THRESHOLD = float(env_value("OCCUPIED_SLOT_THRESHOLD", "0.70"))
+PARKING_AUTO_LOG_SECONDS = float(env_value("PARKING_AUTO_LOG_SECONDS", "10"))
+SLOTS_REFRESH_INTERVAL = int(env_value("SLOTS_REFRESH_INTERVAL", "60"))
+STREAM_SIZE = (640, 360)
+VEHICLE_CLASS_NAMES = {"car", "motorcycle", "bus", "truck"}
+Slot = tuple[int, int, int, int] | dict[str, object]
+
+slot_model = None
+vehicle_model = None
+model = None
+device = "cpu"
+parking_state_lock = threading.Lock()
+parking_state: dict[int, dict[int, dict[str, object]]] = {}
+
+
+def resolve_backend_path(path: str, fallbacks: list[str] | None = None) -> str:
+    """Resolve repo assets whether uvicorn starts from backend/ or project root."""
+    candidates = [path]
+    if not os.path.isabs(path):
+        candidates.append(os.path.join(BASE_DIR, path))
+    for fallback in fallbacks or []:
+        candidates.append(fallback)
+        if not os.path.isabs(fallback):
+            candidates.append(os.path.join(BASE_DIR, fallback))
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    return candidates[1] if len(candidates) > 1 else path
+
+
+def writable_backend_path(path: str) -> str:
+    if os.path.isabs(path):
+        return path
+    return os.path.join(BASE_DIR, path)
+
+
+def is_file_source(source: str) -> bool:
+    """True à¹€à¸¡à¸·à¹ˆà¸­ source à¹€à¸›à¹‡à¸™à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­ à¹„à¸¡à¹ˆà¹ƒà¸Šà¹ˆ RTSP/HTTP stream."""
+    lower = str(source).lower()
+    return not (lower.startswith("rtsp://") or lower.startswith("http://") or lower.startswith("https://"))
+
+
+def build_rtsp_url(username: str, password: str, ip: str) -> str:
+    return f"rtsp://{username}:{password}@{ip}:554/stream2"
+
+
+def get_stream_source(ip: str = "", username: str = "", password: str = "") -> str:
+    """à¸„à¸·à¸™à¸„à¹ˆà¸² source à¸—à¸µà¹ˆ OpenCV/MediaPlayer à¹ƒà¸Šà¹‰à¹€à¸›à¸´à¸”: demo mp4 à¸«à¸£à¸·à¸­ RTSP à¸ˆà¸£à¸´à¸‡."""
+    if USE_DEMO_VIDEO:
+        return resolve_backend_path(DEMO_VIDEO_PATH)
+    return build_rtsp_url(username=username, password=password, ip=ip)
+
+
+def open_video_capture(source: str) -> cv2.VideoCapture:
+    """à¹€à¸›à¸´à¸”à¸§à¸´à¸”à¸µà¹‚à¸­/à¸à¸¥à¹‰à¸­à¸‡ à¹‚à¸”à¸¢à¹ƒà¸Šà¹‰ FFMPEG à¹€à¸‰à¸žà¸²à¸° RTSP."""
+    if is_file_source(source):
+        cap = cv2.VideoCapture(source)
+    else:
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
+        cap.set(cv2.CAP_PROP_FPS, 60)
+    return cap
+
+
+def rewind_if_demo_video(cap: cv2.VideoCapture, source: str) -> bool:
+    """à¸–à¹‰à¸²à¹€à¸›à¹‡à¸™à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­à¹à¸¥à¸°à¸­à¹ˆà¸²à¸™à¸ˆà¸š à¹ƒà¸«à¹‰à¸¢à¹‰à¸­à¸™à¸à¸¥à¸±à¸šà¹„à¸›à¹€à¸Ÿà¸£à¸¡à¹à¸£à¸ à¹à¸¥à¹‰à¸§à¸„à¸·à¸™à¸„à¹ˆà¸² True."""
+    if USE_DEMO_VIDEO or is_file_source(source):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        return True
+    return False
+
+
+def clamp_box(box: tuple[float, float, float, float], width: int, height: int) -> tuple[int, int, int, int] | None:
+    x1, y1, x2, y2 = box
+    x1 = max(0, min(width - 1, int(round(x1))))
+    y1 = max(0, min(height - 1, int(round(y1))))
+    x2 = max(0, min(width - 1, int(round(x2))))
+    y2 = max(0, min(height - 1, int(round(y2))))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def maybe_scale_box(box: tuple[float, float, float, float], width: int, height: int) -> tuple[float, float, float, float]:
+    x1, y1, x2, y2 = box
+    if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
+        return x1 * width, y1 * height, x2 * width, y2 * height
+    return box
+
+
+def roi_to_box(roi, width: int, height: int, source_size: tuple[int, int] | None = None) -> tuple[int, int, int, int] | None:
+    points = None
+    box = None
+
+    if isinstance(roi, dict):
+        if "bbox" in roi:
+            raw = roi["bbox"]
+            if len(raw) >= 4:
+                if roi.get("format") == "xywh":
+                    box = (raw[0], raw[1], raw[0] + raw[2], raw[1] + raw[3])
+                else:
+                    box = tuple(raw[:4])
+        elif all(key in roi for key in ("x1", "y1", "x2", "y2")):
+            box = (roi["x1"], roi["y1"], roi["x2"], roi["y2"])
+        elif all(key in roi for key in ("x", "y", "w", "h")):
+            box = (roi["x"], roi["y"], roi["x"] + roi["w"], roi["y"] + roi["h"])
+        else:
+            points = roi.get("points") or roi.get("polygon") or roi.get("roi")
+    elif isinstance(roi, (list, tuple)):
+        if len(roi) >= 4 and all(isinstance(v, (int, float)) for v in roi[:4]):
+            box = tuple(roi[:4])
+        else:
+            points = roi
+
+    if points:
+        try:
+            xs = [float(p[0]) for p in points]
+            ys = [float(p[1]) for p in points]
+            box = (min(xs), min(ys), max(xs), max(ys))
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    if not box:
+        return None
+
+    box = maybe_scale_box(tuple(float(v) for v in box), width, height)
+
+    if source_size:
+        src_w, src_h = source_size
+        if src_w and src_h and (src_w != width or src_h != height):
+            sx = width / src_w
+            sy = height / src_h
+            box = (box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy)
+
+    return clamp_box(box, width, height)
+
+
+def scale_roi_point(point, width: int, height: int, source_size: tuple[int, int] | None = None) -> tuple[int, int] | None:
+    try:
+        x = float(point[0])
+        y = float(point[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    if max(abs(x), abs(y)) <= 1.5:
+        x *= width
+        y *= height
+    elif source_size:
+        src_w, src_h = source_size
+        if src_w and src_h and (src_w != width or src_h != height):
+            x *= width / src_w
+            y *= height / src_h
+
+    x = max(0, min(width - 1, int(round(x))))
+    y = max(0, min(height - 1, int(round(y))))
+    return x, y
+
+
+def roi_to_slot(roi, width: int, height: int, source_size: tuple[int, int] | None = None) -> Slot | None:
+    raw_points = None
+    if isinstance(roi, dict):
+        raw_points = roi.get("points") or roi.get("polygon") or roi.get("roi")
+    elif isinstance(roi, (list, tuple)) and not (len(roi) >= 4 and all(isinstance(v, (int, float)) for v in roi[:4])):
+        raw_points = roi
+
+    if raw_points:
+        points = [point for point in (scale_roi_point(p, width, height, source_size) for p in raw_points) if point]
+        if len(points) >= 3:
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            box = clamp_box((min(xs), min(ys), max(xs), max(ys)), width, height)
+            if box:
+                return {"box": box, "points": points}
+
+    box = roi_to_box(roi, width, height, source_size)
+    return box
+
+
+def slot_box(slot: Slot) -> tuple[int, int, int, int]:
+    if isinstance(slot, dict):
+        return slot["box"]  # type: ignore[return-value]
+    return slot
+
+
+def slot_polygon(slot: Slot) -> list[tuple[int, int]]:
+    if isinstance(slot, dict):
+        points = slot.get("points")
+        if isinstance(points, list) and len(points) >= 3:
+            return points  # type: ignore[return-value]
+    x1, y1, x2, y2 = slot_box(slot)
+    return [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
+
+def sort_slots(slots: list[Slot]) -> list[Slot]:
+    return sorted(slots, key=lambda slot: (slot_box(slot)[1] // 30, slot_box(slot)[0]))
+
+
+def load_manual_slots(width: int, height: int) -> list[Slot]:
+    path = resolve_backend_path(MANUAL_ROI_PATH)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return []
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("MANUAL_ROI_LOAD_FAILED path=%s error=%s", path, exc)
+        return []
+
+    source_size = None
+    rois = data
+    if isinstance(data, dict):
+        raw_size = data.get("image_size") or data.get("size")
+        if isinstance(raw_size, dict):
+            source_size = (int(raw_size.get("width", 0)), int(raw_size.get("height", 0)))
+        elif isinstance(raw_size, (list, tuple)) and len(raw_size) >= 2:
+            source_size = (int(raw_size[0]), int(raw_size[1]))
+        rois = data.get("rois") or data.get("slots") or data.get("parking_slots") or data.get("manual_rois") or []
+
+    slots = []
+    for roi in rois if isinstance(rois, list) else []:
+        slot = roi_to_slot(roi, width, height, source_size)
+        if slot:
+            slots.append(slot)
+
+    return sort_slots(slots)
+
+
+def boxes_from_yolo(result, width: int, height: int, allowed_names: set[str] | None = None) -> list[tuple[int, int, int, int]]:
+    boxes = []
+    names = getattr(result, "names", {}) or {}
+    for box in getattr(result, "boxes", []):
+        cls_id = int(box.cls[0]) if box.cls is not None else -1
+        cls_name = str(names.get(cls_id, cls_id)).lower()
+        if allowed_names is not None and cls_name not in allowed_names:
+            continue
+        xyxy = box.xyxy[0].detach().cpu().tolist()
+        clamped = clamp_box(tuple(xyxy), width, height)
+        if clamped:
+            boxes.append(clamped)
+    return boxes
+
+
+def scored_boxes_from_yolo(result, width: int, height: int) -> list[tuple[tuple[int, int, int, int], float]]:
+    boxes = []
+    for box in getattr(result, "boxes", []):
+        xyxy = box.xyxy[0].detach().cpu().tolist()
+        clamped = clamp_box(tuple(xyxy), width, height)
+        if clamped:
+            score = float(box.conf[0]) if box.conf is not None else 0.0
+            boxes.append((clamped, score))
+    return boxes
+
+
+def detect_slots(frame, half_precision: bool) -> list[tuple[int, int, int, int]]:
+    if not USE_AUTO_SLOT or slot_model is None:
+        return []
+    result = slot_model(
+        frame,
+        verbose=False,
+        conf=SLOT_CONF,
+        iou=SLOT_IOU,
+        imgsz=SLOT_IMGSZ,
+        device=device,
+        half=half_precision,
+    )[0]
+    height, width = frame.shape[:2]
+    scored_slots = scored_boxes_from_yolo(result, width, height)
+    if SLOT_MAX_COUNT > 0:
+        scored_slots = sorted(scored_slots, key=lambda item: item[1], reverse=True)[:SLOT_MAX_COUNT]
+    return sort_slots([box for box, _ in scored_slots])
+
+
+def detect_vehicles(frame, half_precision: bool) -> list[tuple[int, int, int, int]]:
+    if vehicle_model is None:
+        return []
+    result = vehicle_model(frame, verbose=False, conf=VEHICLE_CONF, device=device, half=half_precision)[0]
+    height, width = frame.shape[:2]
+    return boxes_from_yolo(result, width, height, VEHICLE_CLASS_NAMES)
+
+
+def intersection_area(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def convex_intersection_area(a: list[tuple[int, int]], b: list[tuple[int, int]]) -> float:
+    a_poly = np.array(a, dtype=np.float32)
+    b_poly = np.array(b, dtype=np.float32)
+    area, _ = cv2.intersectConvexConvex(a_poly, b_poly)
+    return float(area)
+
+
+def polygon_area(points: list[tuple[int, int]]) -> float:
+    return float(cv2.contourArea(np.array(points, dtype=np.float32)))
+
+
+def is_slot_occupied(slot: Slot, vehicles: list[tuple[int, int, int, int]]) -> bool:
+    polygon = slot_polygon(slot)
+    slot_area = max(1.0, polygon_area(polygon))
+    for vehicle in vehicles:
+        vehicle_area = max(1, (vehicle[2] - vehicle[0]) * (vehicle[3] - vehicle[1]))
+        vehicle_polygon = [(vehicle[0], vehicle[1]), (vehicle[2], vehicle[1]), (vehicle[2], vehicle[3]), (vehicle[0], vehicle[3])]
+        overlap_area = convex_intersection_area(polygon, vehicle_polygon)
+        vehicle_overlap_ratio = overlap_area / vehicle_area
+        slot_overlap_ratio = overlap_area / slot_area
+        if vehicle_overlap_ratio >= OCCUPIED_THRESHOLD or slot_overlap_ratio >= OCCUPIED_SLOT_THRESHOLD:
+            return True
+    return False
+
+
+def draw_parking_overlay(frame, slots: list[Slot], vehicles: list[tuple[int, int, int, int]]):
+    annotated = frame.copy()
+    occupied_count = 0
+    occupied_slots = []
+
+    if DRAW_VEHICLE_BOXES:
+        for vehicle in vehicles:
+            cv2.rectangle(annotated, (vehicle[0], vehicle[1]), (vehicle[2], vehicle[3]), (255, 180, 0), 1)
+
+    for index, slot in enumerate(slots, start=1):
+        occupied = is_slot_occupied(slot, vehicles)
+        occupied_count += 1 if occupied else 0
+        if occupied:
+            occupied_slots.append(index)
+        color = (0, 0, 255) if occupied else (0, 190, 0)
+        box = slot_box(slot)
+        points = np.array(slot_polygon(slot), dtype=np.int32)
+        cv2.polylines(annotated, [points], True, color, 2)
+        label = str(index)
+        center_x = int(np.mean(points[:, 0]))
+        center_y = int(np.mean(points[:, 1]))
+        (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)
+        text_x = center_x - text_width // 2
+        text_y = center_y + text_height // 2
+        cv2.putText(
+            annotated,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    empty_count = max(0, len(slots) - occupied_count)
+    summary = f"Slots {len(slots)} | Occupied {occupied_count} | Empty {empty_count}"
+    cv2.rectangle(annotated, (8, 8), (330, 42), (0, 0, 0), -1)
+    cv2.putText(annotated, summary, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+    return annotated, {"total": len(slots), "occupied": occupied_count, "empty": empty_count, "occupied_slots": occupied_slots}
+
+
+def annotate_parking_frame(frame, cached_slots: list[Slot] | None = None, force_slot_refresh: bool = False):
+    resized_frame = cv2.resize(frame, STREAM_SIZE)
+    half_precision = str(device).startswith("cuda")
+    slots = cached_slots or []
+
+    if force_slot_refresh or not slots:
+        slots = detect_slots(resized_frame, half_precision)
+        if not slots and USE_MANUAL_ROI_FALLBACK:
+            slots = load_manual_slots(*STREAM_SIZE)
+
+    vehicles = detect_vehicles(resized_frame, half_precision)
+    annotated_frame, stats = draw_parking_overlay(resized_frame, slots, vehicles)
+    return annotated_frame, slots, stats
+
+
+def update_parking_state(camera_id: int, occupied_slots: list[int]) -> tuple[list[int], list[dict[str, object]]]:
+    now = time.time()
+    auto_log_slots: list[int] = []
+    exit_events: list[dict[str, object]] = []
+    occupied_set = set(int(slot) for slot in occupied_slots)
+
+    with parking_state_lock:
+        camera_state = parking_state.setdefault(camera_id, {})
+
+        for slot_number in list(camera_state.keys()):
+            if slot_number not in occupied_set:
+                slot_state = camera_state[slot_number]
+                was_logged = bool(slot_state.get("auto_logged", False)) or bool(slot_state.get("manual_logged", False))
+                if was_logged:
+                    exit_events.append({
+                        "slot_number": slot_number,
+                        "username": slot_state.get("username"),
+                    })
+                del camera_state[slot_number]
+
+        for slot_number in occupied_set:
+            slot_state = camera_state.get(slot_number)
+            if slot_state is None:
+                camera_state[slot_number] = {
+                    "occupied_since": now,
+                    "last_seen": now,
+                    "auto_logged": False,
+                    "manual_logged": False,
+                    "username": None,
+                }
+                continue
+
+            slot_state["last_seen"] = now
+            occupied_since = float(slot_state.get("occupied_since", now))
+            auto_logged = bool(slot_state.get("auto_logged", False))
+            if not auto_logged and now - occupied_since >= PARKING_AUTO_LOG_SECONDS:
+                slot_state["auto_logged"] = True
+                auto_log_slots.append(slot_number)
+
+    return auto_log_slots, exit_events
+
+
+def get_latest_occupied_slots(camera_id: int) -> list[dict[str, object]]:
+    now = time.time()
+    with parking_state_lock:
+        camera_state = parking_state.get(camera_id, {})
+        slots = []
+        for slot_number, slot_state in camera_state.items():
+            occupied_since = float(slot_state.get("occupied_since", now))
+            slots.append({
+                "slot_number": slot_number,
+                "occupied_seconds": max(0.0, now - occupied_since),
+                "manual_logged": bool(slot_state.get("manual_logged", False)),
+                "auto_logged": bool(slot_state.get("auto_logged", False)),
+            })
+    return sorted(slots, key=lambda item: item["occupied_seconds"])
+
+
+def latest_unlogged_slot_number(camera_id: int) -> int | None:
+    with parking_state_lock:
+        camera_state = parking_state.get(camera_id, {})
+        unlogged_slots = {
+            number: state
+            for number, state in camera_state.items()
+            if not bool(state.get("manual_logged", False))
+        }
+        if not unlogged_slots:
+            return None
+        return max(
+            unlogged_slots,
+            key=lambda number: float(unlogged_slots[number].get("occupied_since", 0)),
+        )
+
+
+def mark_manual_logged(camera_id: int, slot_number: int, username: str) -> bool:
+    with parking_state_lock:
+        camera_state = parking_state.get(camera_id, {})
+        unlogged_slots = {
+            number: state
+            for number, state in camera_state.items()
+            if not bool(state.get("manual_logged", False))
+        }
+        if not unlogged_slots:
+            return False
+        latest_slot = max(
+            unlogged_slots,
+            key=lambda number: float(unlogged_slots[number].get("occupied_since", 0)),
+        )
+        if slot_number != latest_slot:
+            return False
+
+        slot_state = camera_state.get(slot_number)
+        if slot_state is None:
+            return False
+        slot_state["manual_logged"] = True
+        slot_state["username"] = username
+        return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # โหลดโมเดล YOLOv8n
-    global model
+    # à¹‚à¸«à¸¥à¸”à¹‚à¸¡à¹€à¸”à¸¥ YOLOv8n
+    global model, slot_model, vehicle_model
     import torch
     global device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = YOLO('yolov8n.pt')
-    print(f"✅ YOLO model loaded on {device}")
+    if AI_DEVICE == "auto":
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    elif AI_DEVICE.startswith("cuda") or AI_DEVICE == "0":
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        if device == "cpu":
+            logger.warning("AI_DEVICE=%s requested but CUDA is not available; falling back to CPU", AI_DEVICE)
+    else:
+        device = AI_DEVICE
+    slot_path = resolve_backend_path(SLOT_MODEL_PATH, ["best.pt"])
+    vehicle_path = resolve_backend_path(VEHICLE_MODEL_PATH, ["yolov8s.pt"])
+    slot_model = YOLO(slot_path) if USE_AUTO_SLOT else None
+    vehicle_model = YOLO(vehicle_path)
+    model = vehicle_model
+    print(f"âœ… YOLO model loaded on {device}")
     
-    # รอฐานข้อมูลพร้อมก่อน init
-    max_retries = 30  # รอ 30 ครั้ง (30 วินาที)
+    # à¸£à¸­à¸à¸²à¸™à¸‚à¹‰à¸­à¸¡à¸¹à¸¥à¸žà¸£à¹‰à¸­à¸¡à¸à¹ˆà¸­à¸™ init
+    max_retries = int(env_value("DB_STARTUP_RETRIES", "1"))
     for i in range(max_retries):
         try:
             conn = get_connection()
             if conn:
                 release_connection(conn)
-                print("✅ Database connected successfully")
+                print("âœ… Database connected successfully")
                 break
         except Exception as e:
-            print(f"⏳ Waiting for database... ({i+1}/{max_retries}) - {e}")
+            print(f"â³ Waiting for database... ({i+1}/{max_retries}) - {e}")
             time.sleep(1)
     else:
-        print("❌ Could not connect to database after retries")
+        print("Database unavailable after retries; starting API without database")
+        yield
         return
 
     # Init database tables
-    init_db()
-    print("✅ Database initialized")
+    try:
+        init_db()
+        print("Database initialized")
+    except Exception as exc:
+        logger.error("Database initialization failed; starting API without database: %s", exc)
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-# ปลดล็อก CORS - ยอมรับทุก origin
+# à¸›à¸¥à¸”à¸¥à¹‡à¸­à¸ CORS - à¸¢à¸­à¸¡à¸£à¸±à¸šà¸—à¸¸à¸ origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ยอมรับทุก domain/origin
+    allow_origins=["*"],  # à¸¢à¸­à¸¡à¸£à¸±à¸šà¸—à¸¸à¸ domain/origin
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -109,6 +624,12 @@ class ParkingHistoryLog(BaseModel):
     username: str
     camera_id: int
     event_type: str = "parking_success"
+    slot_number: int | None = None
+
+
+class RoiMarkerSave(BaseModel):
+    image_size: list[int]
+    rois: list[dict]
 
 # --- User Management ---
 
@@ -182,20 +703,33 @@ async def login(data: UserLogin):
 
 @app.post("/parking_history/log")
 async def log_parking_history(data: ParkingHistoryLog):
-    """บันทึกประวัติการเข้าจอด"""
-    success = add_parking_history(data.username, data.camera_id, data.event_type)
+    """à¸šà¸±à¸™à¸—à¸¶à¸à¸›à¸£à¸°à¸§à¸±à¸•à¸´à¸à¸²à¸£à¹€à¸‚à¹‰à¸²à¸ˆà¸­à¸”"""
+    slot_number = data.slot_number
+    if slot_number is None:
+        slot_number = latest_unlogged_slot_number(data.camera_id)
+    if slot_number is None:
+        raise HTTPException(status_code=409, detail="No latest occupied slot is available")
+    if not mark_manual_logged(data.camera_id, slot_number, data.username):
+        raise HTTPException(status_code=409, detail="Selected slot is not the latest occupied slot or was already logged")
+
+    success = add_parking_history(data.username, data.camera_id, data.event_type, slot_number)
     
     if success:
         logger.info("PARKING_LOG_SUCCESS username=%s camera_id=%s", data.username, data.camera_id)
-        return {"status": "success", "message": "Parking history logged"}
+        return {"status": "success", "message": "Parking history logged", "slot_number": slot_number}
     
     logger.error("PARKING_LOG_ERROR username=%s camera_id=%s", data.username, data.camera_id)
     raise HTTPException(status_code=500, detail="Failed to log parking history")
 
 
+@app.get("/parking_status/latest")
+async def latest_parking_status(camera_id: int):
+    return {"status": "success", "slots": get_latest_occupied_slots(camera_id)}
+
+
 @app.get("/parking_history")
 async def get_user_parking_history(username: str, limit: int = 100):
-    """ดึงประวัติการเข้าจอดของผู้ใช้"""
+    """à¸”à¸¶à¸‡à¸›à¸£à¸°à¸§à¸±à¸•à¸´à¸à¸²à¸£à¹€à¸‚à¹‰à¸²à¸ˆà¸­à¸”à¸‚à¸­à¸‡à¸œà¸¹à¹‰à¹ƒà¸Šà¹‰"""
     try:
         history = get_parking_history(username=username, limit=limit)
         return {"status": "success", "data": history}
@@ -206,7 +740,7 @@ async def get_user_parking_history(username: str, limit: int = 100):
 
 @app.get("/parking_history/admin")
 async def get_admin_parking_history(zone_name: str = None, limit: int = 100):
-    """ดึงประวัติการเข้าจอด (Admin only - แยกตามโซน)"""
+    """à¸”à¸¶à¸‡à¸›à¸£à¸°à¸§à¸±à¸•à¸´à¸à¸²à¸£à¹€à¸‚à¹‰à¸²à¸ˆà¸­à¸” (Admin only - à¹à¸¢à¸à¸•à¸²à¸¡à¹‚à¸‹à¸™)"""
     try:
         history = get_parking_history(zone_name=zone_name, limit=limit)
         return {"status": "success", "data": history}
@@ -220,16 +754,19 @@ pcs = set()
 
 @app.post("/offer")
 async def webrtc_offer(data: WebRTCOffer):
-    # สร้าง RTSP URL
-    url = f"rtsp://{data.camera.username}:{data.camera.password}@{data.camera.ip}:554/stream2"
+    # à¸ªà¸£à¹‰à¸²à¸‡ source à¸ªà¸³à¸«à¸£à¸±à¸š WebRTC: à¹ƒà¸Šà¹‰à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­à¹€à¸¡à¸·à¹ˆà¸­ USE_DEMO_VIDEO=true à¸«à¸£à¸·à¸­à¹ƒà¸Šà¹‰ RTSP à¸ˆà¸£à¸´à¸‡
+    url = get_stream_source(data.camera.ip, data.camera.username, data.camera.password)
+    print(f"ðŸŽ¥ WebRTC source: {url}")
+
+    if is_file_source(url):
+        player = MediaPlayer(url)
+    else:
+        player = MediaPlayer(url, format="rtsp", options={
+            "rtsp_transport": "tcp",
+            "stimeout": "5000000"
+        })
     
-    # สร้าง MediaPlayer สำหรับ RTSP
-    player = MediaPlayer(url, format="rtsp", options={
-        "rtsp_transport": "tcp",
-        "stimeout": "5000000"
-    })
-    
-    # สร้าง PeerConnection
+    # à¸ªà¸£à¹‰à¸²à¸‡ PeerConnection
     pc = RTCPeerConnection()
     pcs.add(pc)
     
@@ -240,15 +777,15 @@ async def webrtc_offer(data: WebRTCOffer):
             await pc.close()
             pcs.discard(pc)
     
-    # เพิ่ม video track
+    # à¹€à¸žà¸´à¹ˆà¸¡ video track
     if player.video:
         pc.addTrack(player.video)
     
-    # ตั้ง remote description จาก offer
+    # à¸•à¸±à¹‰à¸‡ remote description à¸ˆà¸²à¸ offer
     offer = RTCSessionDescription(sdp=data.sdp, type=data.type)
     await pc.setRemoteDescription(offer)
     
-    # สร้าง answer
+    # à¸ªà¸£à¹‰à¸²à¸‡ answer
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
     
@@ -261,13 +798,13 @@ async def webrtc_offer(data: WebRTCOffer):
 @app.websocket("/ws/live")
 async def websocket_live(websocket: WebSocket):
     await websocket.accept()
-    print("🔗 WebSocket connected for live stream")
+    print("ðŸ”— WebSocket connected for live stream")
 
     def _is_disconnect_exception(exc: Exception) -> bool:
         name = type(exc).__name__
         return name in {"WebSocketDisconnect", "ClientDisconnected"}
     
-    # รับ camera data จาก client
+    # à¸£à¸±à¸š camera data à¸ˆà¸²à¸ client
     try:
         data = await websocket.receive_json()
         camera_id = int(data['camera_id'])
@@ -280,29 +817,30 @@ async def websocket_live(websocket: WebSocket):
         ip = cam['ip_address']
         username = cam['username']
         password = cam['password']
-        print(f"📡 Received camera request: camera_id={camera_id}, IP={ip}")
+        print(f"ðŸ“¡ Received camera request: camera_id={camera_id}, IP={ip}")
     except Exception as e:
-        print(f"❌ Failed to receive camera data: {e}")
+        print(f"âŒ Failed to receive camera data: {e}")
         await websocket.close()
         return
     
-    # สร้าง RTSP URL
-    url = f"rtsp://{username}:{password}@{ip}:554/stream2"
-    print(f"🎥 Starting live stream for camera_id={camera_id}, ip={ip}")
-    
-    # เปิด camera
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
-    cap.set(cv2.CAP_PROP_FPS, 60)
+    # à¸ªà¸£à¹‰à¸²à¸‡ source: à¸–à¹‰à¸² USE_DEMO_VIDEO=true à¸ˆà¸°à¹€à¸›à¸´à¸”à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­à¹à¸—à¸™ RTSP
+    url = get_stream_source(ip=ip, username=username, password=password)
+    if USE_DEMO_VIDEO:
+        print(f"ðŸŽ¥ Starting DEMO video for camera_id={camera_id}: {url}")
+    else:
+        print(f"ðŸŽ¥ Starting live stream for camera_id={camera_id}, ip={ip}")
 
-    # เช็คว่าเปิด RTSP ได้สำเร็จก่อน (ป้องกันเชื่อมไม่ได้แต่เข้าสูตร loop)
+    # à¹€à¸›à¸´à¸” camera à¸«à¸£à¸·à¸­à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­
+    cap = open_video_capture(url)
+
+    # à¹€à¸Šà¹‡à¸„à¸§à¹ˆà¸²à¹€à¸›à¸´à¸” RTSP à¹„à¸”à¹‰à¸ªà¸³à¹€à¸£à¹‡à¸ˆà¸à¹ˆà¸­à¸™ (à¸›à¹‰à¸­à¸‡à¸à¸±à¸™à¹€à¸Šà¸·à¹ˆà¸­à¸¡à¹„à¸¡à¹ˆà¹„à¸”à¹‰à¹à¸•à¹ˆà¹€à¸‚à¹‰à¸²à¸ªà¸¹à¸•à¸£ loop)
     if not cap.isOpened():
-        print("❌ Cannot open camera stream")
-        await websocket.send_text('error: cannot open camera stream')
+        print(f"âŒ Cannot open video source: {url}")
+        await websocket.send_text('error: cannot open video source')
         await websocket.close()
         return
 
-    print("✅ Camera stream opened successfully")
+    print("âœ… Video source opened successfully")
     frame_count = 0
 
     frame_queue = asyncio.Queue(maxsize=3)
@@ -313,7 +851,10 @@ async def websocket_live(websocket: WebSocket):
         while not stop_event.is_set():
             success, frame = await asyncio.get_running_loop().run_in_executor(None, cap.read)
             if not success or frame is None:
-                print("⚠️ Failed to read frame from camera")
+                if rewind_if_demo_video(cap, url):
+                    await asyncio.sleep(0.03)
+                    continue
+                print("âš ï¸ Failed to read frame from camera")
                 await asyncio.sleep(0.05)
                 continue
 
@@ -331,6 +872,8 @@ async def websocket_live(websocket: WebSocket):
         nonlocal frame_count
         avg_proc = 0.08
         alpha = 0.1
+        cached_slots = []
+        last_slot_refresh = 0.0
 
         while not stop_event.is_set():
             try:
@@ -339,14 +882,34 @@ async def websocket_live(websocket: WebSocket):
                 continue
 
             t0 = time.time()
-            resized_frame = cv2.resize(frame, (640, 360))
-            half_precision = device == 'cuda'
-            results = model(resized_frame, verbose=False, conf=0.4, device=device, half=half_precision)
-            annotated_frame = results[0].plot()
+            now = time.time()
+            force_slot_refresh = not cached_slots or (now - last_slot_refresh) >= SLOTS_REFRESH_INTERVAL
+            annotated_frame, cached_slots, stats = annotate_parking_frame(frame, cached_slots, force_slot_refresh)
+            if force_slot_refresh:
+                last_slot_refresh = now
+            auto_log_slots, exit_events = update_parking_state(camera_id, stats.get("occupied_slots", []))
+            for slot_number in auto_log_slots:
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    add_parking_history,
+                    None,
+                    camera_id,
+                    "parking_auto",
+                    slot_number,
+                )
+            for event in exit_events:
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    add_parking_history,
+                    event.get("username"),
+                    camera_id,
+                    "parking_exit",
+                    event["slot_number"],
+                )
             success, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
 
             if not success:
-                print("⚠️ JPEG encoding failed")
+                print("âš ï¸ JPEG encoding failed")
                 continue
 
             try:
@@ -356,7 +919,7 @@ async def websocket_live(websocket: WebSocket):
                 return
             except RuntimeError as e:
                 # Raised when client disconnects and websocket is already closed.
-                print(f"ℹ️ WebSocket send stopped: {e}")
+                print(f"â„¹ï¸ WebSocket send stopped: {e}")
                 stop_event.set()
                 return
             except Exception as e:
@@ -373,7 +936,7 @@ async def websocket_live(websocket: WebSocket):
             sleep_time = max(0.0, 1.0 / target_fps - proc_time)
 
             if frame_count % 50 == 0:
-                print(f"📊 Sent {frame_count} frames, avg_proc={avg_proc:.3f}s, target_fps={target_fps}, queue_size={frame_queue.qsize()}")
+                print(f"ðŸ“Š Sent {frame_count} frames, avg_proc={avg_proc:.3f}s, target_fps={target_fps}, queue_size={frame_queue.qsize()}")
 
             await asyncio.sleep(sleep_time)
 
@@ -393,13 +956,13 @@ async def websocket_live(websocket: WebSocket):
             if exc is None:
                 continue
             if _is_disconnect_exception(exc):
-                print("ℹ️ WebSocket client disconnected")
+                print("â„¹ï¸ WebSocket client disconnected")
                 continue
-            print(f"❌ Error in streaming pipeline: {type(exc).__name__}: {exc}")
+            print(f"âŒ Error in streaming pipeline: {type(exc).__name__}: {exc}")
     except WebSocketDisconnect:
-        print("ℹ️ WebSocket client disconnected")
+        print("â„¹ï¸ WebSocket client disconnected")
     except Exception as e:
-        print(f"❌ Error in streaming pipeline: {type(e).__name__}: {e}")
+        print(f"âŒ Error in streaming pipeline: {type(e).__name__}: {e}")
     finally:
         stop_event.set()
         try:
@@ -411,7 +974,7 @@ async def websocket_live(websocket: WebSocket):
             capture_task.cancel()
             process_task.cancel()
         cap.release()
-        print("🔚 Camera released, WebSocket closing")
+        print("ðŸ”š Camera released, WebSocket closing")
         try:
             await websocket.close()
         except Exception:
@@ -430,12 +993,13 @@ async def websocket_preview_camera(websocket: WebSocket):
         username = data['username']
         password = data['password']
 
-        url = f"rtsp://{username}:{password}@{ip}:554/stream2"
-        print(f"🔎 Preview stream open for ip={ip}")
+        url = get_stream_source(ip=ip, username=username, password=password)
+        if USE_DEMO_VIDEO:
+            print(f"ðŸ”Ž Preview DEMO video open: {url}")
+        else:
+            print(f"ðŸ”Ž Preview stream open for ip={ip}")
 
-        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FPS, 60)
+        cap = open_video_capture(url)
 
         if not cap.isOpened():
             await websocket.send_text("error: cannot open camera stream")
@@ -444,6 +1008,9 @@ async def websocket_preview_camera(websocket: WebSocket):
         while True:
             success, frame = await asyncio.get_running_loop().run_in_executor(None, cap.read)
             if not success or frame is None:
+                if rewind_if_demo_video(cap, url):
+                    await asyncio.sleep(0.03)
+                    continue
                 await asyncio.sleep(0.01)
                 continue
 
@@ -458,7 +1025,7 @@ async def websocket_preview_camera(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        print(f"❌ Preview WebSocket error: {e}")
+        print(f"âŒ Preview WebSocket error: {e}")
     finally:
         if cap:
             cap.release()
@@ -509,20 +1076,26 @@ class CameraStream:
                         self.frame = frame.copy()
                         self.status = True
                 else:
-                    self.status = False
-                    time.sleep(1)
+                    # à¸–à¹‰à¸²à¹€à¸›à¹‡à¸™à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­à¹à¸¥à¸°à¸ˆà¸šà¸„à¸¥à¸´à¸› à¹ƒà¸«à¹‰ loop à¸à¸¥à¸±à¸šà¹„à¸›à¹€à¸Ÿà¸£à¸¡à¹à¸£à¸
+                    if self.current_url and rewind_if_demo_video(self.cap, self.current_url):
+                        self.status = False
+                        time.sleep(0.03)
+                    else:
+                        self.status = False
+                        time.sleep(1)
             else:
                 time.sleep(0.1)
 
     def change_camera(self, url):
         if self.current_url != url:
             with self.lock:
-                print(f"🔄 Switching camera to: {url}")
+                print(f"ðŸ”„ Switching camera to: {url}")
                 if self.cap:
                     self.cap.release()
                 self.current_url = url
-                self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.cap = open_video_capture(url)
+                if not is_file_source(url):
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 cam_manager = CameraStream()
 
@@ -551,27 +1124,124 @@ async def global_exception_handler(request: Request, exc: Exception):
 # --- Health & Debug Routes ---
 @app.get("/ping")
 async def ping():
-    """ทดสอบว่า backend + ngrok ตอบได้ปกติ"""
+    """à¸—à¸”à¸ªà¸­à¸šà¸§à¹ˆà¸² backend + ngrok à¸•à¸­à¸šà¹„à¸”à¹‰à¸›à¸à¸•à¸´"""
     return {"status": "ok", "time": time.time()}
+
+
+@app.get("/roi_marker", response_class=HTMLResponse)
+async def roi_marker_page():
+    path = resolve_backend_path("roi_marker.html")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="ROI marker page not found")
+    with open(path, "r", encoding="utf-8") as file:
+        return HTMLResponse(file.read())
+
+
+@app.get("/roi_marker/data")
+async def roi_marker_data():
+    path = resolve_backend_path(MANUAL_ROI_PATH)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {"image_size": [960, 540], "rois": []}
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read ROI file: {exc}")
+
+    return data
+
+
+@app.get("/roi_marker/frame")
+async def roi_marker_frame(camera_id: int | None = None, second: float = 50.0):
+    if camera_id is not None and not USE_DEMO_VIDEO:
+        cam = get_camera_credentials(camera_id)
+        if not cam:
+            raise HTTPException(status_code=404, detail="Camera not found")
+        source = get_stream_source(
+            ip=cam["ip_address"],
+            username=cam["username"],
+            password=cam["password"],
+        )
+    else:
+        source = get_stream_source()
+
+    cap = open_video_capture(source)
+    try:
+        if not cap.isOpened():
+            raise HTTPException(status_code=500, detail="Cannot open video source")
+        if is_file_source(source):
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, second) * 1000)
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+
+    if not ok or frame is None:
+        raise HTTPException(status_code=500, detail="Cannot read frame")
+
+    frame = cv2.resize(frame, (960, 540))
+    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ok:
+        raise HTTPException(status_code=500, detail="Cannot encode frame")
+    return Response(content=buffer.tobytes(), media_type="image/jpeg")
+
+
+@app.post("/roi_marker/save")
+async def roi_marker_save(data: RoiMarkerSave):
+    if len(data.image_size) < 2:
+        raise HTTPException(status_code=400, detail="image_size must contain width and height")
+
+    cleaned_rois = []
+    for roi in data.rois:
+        points = roi.get("points")
+        if not isinstance(points, list) or len(points) < 3:
+            continue
+        cleaned_points = []
+        for point in points[:4]:
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            cleaned_points.append([int(round(float(point[0]))), int(round(float(point[1])))])
+        if len(cleaned_points) >= 3:
+            cleaned_rois.append({"points": cleaned_points})
+
+    output = {
+        "image_size": [int(data.image_size[0]), int(data.image_size[1])],
+        "rois": cleaned_rois,
+    }
+
+    path = writable_backend_path(MANUAL_ROI_PATH)
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temp_path = f"{path}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as file:
+            json.dump(output, file, indent=2)
+            file.write("\n")
+        os.replace(temp_path, path)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save ROI file: {exc}")
+
+    return {"status": "success", "slots": len(cleaned_rois), "path": path}
 
 
 @app.options("/get_cameras")
 async def get_cameras_options():
-    """CORS preflight - ให้ CORSMiddleware จัดการ"""
-    print("📋 OPTIONS /get_cameras preflight")
+    """CORS preflight - à¹ƒà¸«à¹‰ CORSMiddleware à¸ˆà¸±à¸”à¸à¸²à¸£"""
+    print("ðŸ“‹ OPTIONS /get_cameras preflight")
     return {}
 
 
 @app.get("/get_cameras")
 async def get_cameras():
-    """ดึงรายการกล้องทั้งหมด - ให้ CORSMiddleware จัดการ header"""
-    print("➡️ /get_cameras called")
+    """à¸”à¸¶à¸‡à¸£à¸²à¸¢à¸à¸²à¸£à¸à¸¥à¹‰à¸­à¸‡à¸—à¸±à¹‰à¸‡à¸«à¸¡à¸” - à¹ƒà¸«à¹‰ CORSMiddleware à¸ˆà¸±à¸”à¸à¸²à¸£ header"""
+    print("âž¡ï¸ /get_cameras called")
     request_time = time.time()
     try:
         cameras = get_all_cameras()
         elapsed = time.time() - request_time
-        print(f"✅ /get_cameras returned {len(cameras)} cameras in {elapsed:.3f}s")
-        # ส่ง data กลับอย่างเรียบร้อย ไม่ต้อง custom headers
+        print(f"âœ… /get_cameras returned {len(cameras)} cameras in {elapsed:.3f}s")
+        # à¸ªà¹ˆà¸‡ data à¸à¸¥à¸±à¸šà¸­à¸¢à¹ˆà¸²à¸‡à¹€à¸£à¸µà¸¢à¸šà¸£à¹‰à¸­à¸¢ à¹„à¸¡à¹ˆà¸•à¹‰à¸­à¸‡ custom headers
         return cameras
     except Exception as e:
         elapsed = time.time() - request_time
@@ -584,52 +1254,59 @@ async def get_frame(data: CameraByIdRequest):
     if not cam:
         raise HTTPException(status_code=404, detail="Camera not found")
 
-    target_url = f"rtsp://{cam['username']}:{cam['password']}@{cam['ip_address']}:554/stream2"
+    target_url = get_stream_source(
+        ip=cam['ip_address'],
+        username=cam['username'],
+        password=cam['password'],
+    )
     cam_manager.change_camera(target_url)
 
     if cam_manager.status and cam_manager.frame is not None:
         with cam_manager.lock:
             input_frame = cam_manager.frame.copy()
 
-        # ประมวลผล AI
-        results = model(input_frame, verbose=False, conf=0.4)
-        annotated_frame = results[0].plot()
+        # à¸›à¸£à¸°à¸¡à¸§à¸¥à¸œà¸¥ AI
+        annotated_frame, _, stats = annotate_parking_frame(input_frame, force_slot_refresh=True)
 
-        # ย่อขนาดและเข้ารหัส
-        resized_frame = cv2.resize(annotated_frame, (640, 360))
-        _, buffer = cv2.imencode('.jpg', resized_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        # à¸¢à¹ˆà¸­à¸‚à¸™à¸²à¸”à¹à¸¥à¸°à¹€à¸‚à¹‰à¸²à¸£à¸«à¸±à¸ª
+        _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         jpg_as_text = base64.b64encode(buffer).decode('utf-8')
         
         return {
             "status": "success", 
             "image": jpg_as_text,
-            "count": len(results[0].boxes)
+            "count": stats["occupied"],
+            "slots": stats
         }
     
     return {"status": "error", "message": "Connecting..."}
 
 @app.post("/preview_camera")
 async def preview_camera(data: CameraByIdRequest):
-    """ฟังก์ชันสำหรับกด Preview ดูภาพก่อนบันทึก"""
+    """à¸Ÿà¸±à¸‡à¸à¹Œà¸Šà¸±à¸™à¸ªà¸³à¸«à¸£à¸±à¸šà¸à¸” Preview à¸”à¸¹à¸ à¸²à¸žà¸à¹ˆà¸­à¸™à¸šà¸±à¸™à¸—à¸¶à¸"""
     cam = get_camera_credentials(data.camera_id)
     if not cam:
         raise HTTPException(status_code=404, detail="Camera not found")
 
-    target_url = f"rtsp://{cam['username']}:{cam['password']}@{cam['ip_address']}:554/stream2"
-    
-    # ทดสอบดึงภาพด้วย OpenCV
-    cap = cv2.VideoCapture(target_url)
+    target_url = get_stream_source(
+        ip=cam['ip_address'],
+        username=cam['username'],
+        password=cam['password'],
+    )
+
+    # à¸—à¸”à¸ªà¸­à¸šà¸”à¸¶à¸‡à¸ à¸²à¸žà¸”à¹‰à¸§à¸¢ OpenCV
+    cap = open_video_capture(target_url)
     success, frame = cap.read()
-    cap.release() # เปิดแล้วรีบปิดทันทีเพื่อไม่ให้ค้าง
+    cap.release() # à¹€à¸›à¸´à¸”à¹à¸¥à¹‰à¸§à¸£à¸µà¸šà¸›à¸´à¸”à¸—à¸±à¸™à¸—à¸µà¹€à¸žà¸·à¹ˆà¸­à¹„à¸¡à¹ˆà¹ƒà¸«à¹‰à¸„à¹‰à¸²à¸‡
 
     if success:
-        # ย่อขนาดและแปลงเป็น Base64 ส่งกลับไปให้ดู
+        # à¸¢à¹ˆà¸­à¸‚à¸™à¸²à¸”à¹à¸¥à¸°à¹à¸›à¸¥à¸‡à¹€à¸›à¹‡à¸™ Base64 à¸ªà¹ˆà¸‡à¸à¸¥à¸±à¸šà¹„à¸›à¹ƒà¸«à¹‰à¸”à¸¹
         resized = cv2.resize(frame, (640, 360))
         _, buffer = cv2.imencode('.jpg', resized, [cv2.IMWRITE_JPEG_QUALITY, 80])
         jpg_as_text = base64.b64encode(buffer).decode('utf-8')
         return {"status": "success", "image": jpg_as_text}
     
-    return {"status": "error", "message": "ไม่สามารถเชื่อมต่อกล้องได้ โปรดเช็ค IP หรือ User/Pass"}
+    return {"status": "error", "message": "à¹„à¸¡à¹ˆà¸ªà¸²à¸¡à¸²à¸£à¸–à¹€à¸Šà¸·à¹ˆà¸­à¸¡à¸•à¹ˆà¸­à¸à¸¥à¹‰à¸­à¸‡à¹„à¸”à¹‰ à¹‚à¸›à¸£à¸”à¹€à¸Šà¹‡à¸„ IP à¸«à¸£à¸·à¸­ User/Pass"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

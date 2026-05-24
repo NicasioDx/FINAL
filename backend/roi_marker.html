@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Parking ROI Marker</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Arial, Helvetica, sans-serif;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --ink: #17202a;
+      --muted: #697586;
+      --line: #d6dde6;
+      --green: #00b52d;
+      --blue: #2558d8;
+      --red: #d0342c;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 16px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 4;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    button, input {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      height: 36px;
+      padding: 0 10px;
+      font-size: 14px;
+    }
+
+    button {
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    button.primary {
+      background: var(--blue);
+      color: #fff;
+      border-color: var(--blue);
+    }
+
+    button.danger {
+      color: #fff;
+      background: var(--red);
+      border-color: var(--red);
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 280px;
+      gap: 14px;
+      padding: 14px;
+    }
+
+    .stage {
+      background: #0c1117;
+      border: 1px solid var(--line);
+      overflow: auto;
+      min-height: 300px;
+    }
+
+    canvas {
+      display: block;
+      width: min(100%, 960px);
+      height: auto;
+      cursor: crosshair;
+    }
+
+    aside {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      padding: 12px;
+      min-height: 300px;
+    }
+
+    .status {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+      margin: 0 0 10px;
+    }
+
+    .slot-list {
+      display: grid;
+      gap: 6px;
+      max-height: calc(100vh - 180px);
+      overflow: auto;
+    }
+
+    .slot-item {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 13px;
+      background: #fff;
+    }
+
+    .slot-item.active {
+      border-color: var(--green);
+      box-shadow: inset 3px 0 0 var(--green);
+    }
+
+    @media (max-width: 900px) {
+      header { align-items: flex-start; flex-direction: column; }
+      main { grid-template-columns: 1fr; }
+      aside { min-height: 0; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Parking ROI Marker</h1>
+    <div class="toolbar">
+      <label>Frame second <input id="secondInput" type="number" value="50" min="0" step="1"></label>
+      <button id="reloadBtn">Reload frame</button>
+      <button id="undoPointBtn">Undo point</button>
+      <button id="undoSlotBtn">Undo slot</button>
+      <button id="clearBtn" class="danger">Clear</button>
+      <button id="saveBtn" class="primary">Save manual_rois.json</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="stage">
+      <canvas id="canvas" width="960" height="540"></canvas>
+    </section>
+    <aside>
+      <p class="status" id="status"></p>
+      <div class="slot-list" id="slotList"></div>
+    </aside>
+  </main>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const slotListEl = document.getElementById('slotList');
+    const secondInput = document.getElementById('secondInput');
+
+    const image = new Image();
+    let rois = [];
+    let current = [];
+    const imageSize = [960, 540];
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function canvasPoint(event) {
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      return [
+        Math.round((event.clientX - rect.left) * scaleX),
+        Math.round((event.clientY - rect.top) * scaleY)
+      ];
+    }
+
+    function drawPoint(point, color, label) {
+      ctx.beginPath();
+      ctx.arc(point[0], point[1], 5, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#ffffff';
+      ctx.stroke();
+      if (label) {
+        ctx.font = '14px Arial';
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#000000';
+        ctx.strokeText(label, point[0] + 7, point[1] - 7);
+        ctx.fillStyle = color;
+        ctx.fillText(label, point[0] + 7, point[1] - 7);
+      }
+    }
+
+    function drawPolygon(points, color, width) {
+      if (!points.length) return;
+      ctx.beginPath();
+      ctx.moveTo(points[0][0], points[0][1]);
+      for (const point of points.slice(1)) ctx.lineTo(point[0], point[1]);
+      if (points.length >= 3) ctx.closePath();
+      ctx.lineWidth = width;
+      ctx.strokeStyle = color;
+      ctx.stroke();
+      if (points.length >= 3) {
+        ctx.fillStyle = 'rgba(0, 181, 45, 0.12)';
+        ctx.fill();
+      }
+    }
+
+    function redraw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (image.complete && image.naturalWidth) {
+        ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      }
+
+      rois.forEach((roi, index) => {
+        drawPolygon(roi.points, '#00c83c', 3);
+        roi.points.forEach((point, pointIndex) => drawPoint(point, '#00c83c', pointIndex === 0 ? String(index + 1) : ''));
+      });
+
+      drawPolygon(current, '#2558d8', 3);
+      current.forEach((point, index) => drawPoint(point, '#2558d8', String(index + 1)));
+
+      renderList();
+      setStatus(`Saved slots: ${rois.length}. Current slot points: ${current.length}/4. Click 4 corners clockwise or counter-clockwise.`);
+    }
+
+    function renderList() {
+      slotListEl.innerHTML = '';
+      rois.forEach((roi, index) => {
+        const item = document.createElement('div');
+        item.className = 'slot-item';
+        item.textContent = `${index + 1}: ${roi.points.map(point => `[${point[0]},${point[1]}]`).join(' ')}`;
+        slotListEl.appendChild(item);
+      });
+      if (current.length) {
+        const item = document.createElement('div');
+        item.className = 'slot-item active';
+        item.textContent = `New: ${current.map(point => `[${point[0]},${point[1]}]`).join(' ')}`;
+        slotListEl.appendChild(item);
+      }
+    }
+
+    function addPoint(point) {
+      current.push(point);
+      if (current.length === 4) {
+        rois.push({ points: current });
+        current = [];
+      }
+      redraw();
+    }
+
+    async function loadData() {
+      const response = await fetch('/roi_marker/data');
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      rois = Array.isArray(data.rois) ? data.rois.filter(roi => Array.isArray(roi.points)) : [];
+      current = [];
+      redraw();
+    }
+
+    function loadFrame() {
+      const second = Number(secondInput.value || 0);
+      image.src = `/roi_marker/frame?second=${encodeURIComponent(second)}&t=${Date.now()}`;
+    }
+
+    async function save() {
+      const response = await fetch('/roi_marker/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_size: imageSize, rois })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      setStatus(`Saved ${data.slots} slots to manual_rois.json`);
+    }
+
+    canvas.addEventListener('click', event => addPoint(canvasPoint(event)));
+    image.addEventListener('load', redraw);
+
+    document.getElementById('reloadBtn').addEventListener('click', loadFrame);
+    document.getElementById('undoPointBtn').addEventListener('click', () => {
+      current.pop();
+      redraw();
+    });
+    document.getElementById('undoSlotBtn').addEventListener('click', () => {
+      if (current.length) current = [];
+      else rois.pop();
+      redraw();
+    });
+    document.getElementById('clearBtn').addEventListener('click', () => {
+      if (confirm('Clear all marked slots?')) {
+        rois = [];
+        current = [];
+        redraw();
+      }
+    });
+    document.getElementById('saveBtn').addEventListener('click', () => {
+      save().catch(error => setStatus(`Save failed: ${error.message}`));
+    });
+
+    loadFrame();
+    loadData().catch(error => setStatus(`Load failed: ${error.message}`));
+  </script>
+</body>
+</html>

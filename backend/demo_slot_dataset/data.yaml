@@ -1,0 +1,5 @@
+path: C:/Users/maeki/OneDrive/Desktop/PJM-main/backend/demo_slot_dataset
+train: images/train
+val: images/val
+names:
+  0: parking_slot

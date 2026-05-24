@@ -134,7 +134,7 @@ def init_db():
         id SERIAL PRIMARY KEY,
         camera_name VARCHAR(100) NOT NULL,
         ip_address VARCHAR(50) NOT NULL,
-        username VARCHAR(100) NOT NULL,
+        username VARCHAR(100),
         password VARCHAR(100) NOT NULL,
         zone_name VARCHAR(100) NOT NULL DEFAULT 'ทั่วไป',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -154,10 +154,11 @@ def init_db():
     parking_history_query = """
     CREATE TABLE IF NOT EXISTS parking_history (
         id SERIAL PRIMARY KEY,
-        username VARCHAR(100) NOT NULL,
+        username VARCHAR(100),
         camera_id INTEGER NOT NULL,
         zone_name VARCHAR(100) NOT NULL DEFAULT 'ทั่วไป',
         event_type VARCHAR(50) NOT NULL,
+        slot_number INTEGER,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
     );
@@ -179,6 +180,8 @@ def init_db():
             # Add columns if they don't exist (for existing tables)
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'customer'")
             cur.execute("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS zone_name VARCHAR(100) NOT NULL DEFAULT 'ทั่วไป'")
+            cur.execute("ALTER TABLE parking_history ALTER COLUMN username DROP NOT NULL")
+            cur.execute("ALTER TABLE parking_history ADD COLUMN IF NOT EXISTS slot_number INTEGER")
             conn.commit()
             print("✅ Database initialized successfully")
         finally:
@@ -324,7 +327,7 @@ def authenticate_user(username: str, password: str) -> UserActionResult:
         release_connection(conn)
 
 
-def add_parking_history(username: str, camera_id: int, event_type: str = "parking_success") -> bool:
+def add_parking_history(username: str | None, camera_id: int, event_type: str = "parking_success", slot_number: int | None = None) -> bool:
     """บันทึกประวัติการเข้าจอด"""
     conn = get_connection()
     if not conn:
@@ -339,8 +342,8 @@ def add_parking_history(username: str, camera_id: int, event_type: str = "parkin
         
         # Insert parking history
         cur.execute(
-            "INSERT INTO parking_history (username, camera_id, zone_name, event_type) VALUES (%s, %s, %s, %s)",
-            (username, camera_id, zone_name, event_type)
+            "INSERT INTO parking_history (username, camera_id, zone_name, event_type, slot_number) VALUES (%s, %s, %s, %s, %s)",
+            (username, camera_id, zone_name, event_type, slot_number)
         )
         conn.commit()
         return True
@@ -365,7 +368,7 @@ def get_parking_history(username: str = None, zone_name: str = None, limit: int 
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
         query = (
-            "SELECT ph.username, ph.camera_id, c.camera_name, ph.zone_name, ph.event_type, ph.created_at "
+            "SELECT ph.username, ph.camera_id, c.camera_name, ph.zone_name, ph.event_type, ph.slot_number, ph.created_at "
             "FROM parking_history ph "
             "LEFT JOIN cameras c ON c.id = ph.camera_id "
             "WHERE 1=1"
@@ -420,4 +423,3 @@ def get_user_role(username: str) -> str:
         if cur:
             cur.close()
         release_connection(conn)
-

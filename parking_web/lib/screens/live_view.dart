@@ -24,6 +24,8 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
   bool _isConnected = false;
   bool _isFullScreen = false;
   bool _isSavingHistory = false;
+  bool _isAdmin = false;
+  String? _streamError;
   int _retryCount = 0;
   static const int _maxRetries = 5;
   late final String _serverUrl;
@@ -32,7 +34,17 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
   void initState() {
     super.initState();
     _serverUrl = _buildWebSocketUrl();
+    _loadRole();
     _connectWebSocket();
+  }
+
+  Future<void> _loadRole() async {
+    final role = await SessionStore.getRole();
+    if (mounted) {
+      setState(() {
+        _isAdmin = role == 'admin';
+      });
+    }
   }
 
   String _buildWebSocketUrl() {
@@ -46,9 +58,11 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
 
   void _connectWebSocket() {
     try {
+      _channel?.sink.close();
       _channel = WebSocketChannel.connect(
         Uri.parse(_serverUrl),
       );
+      print('Opening live stream camera_id=${widget.cameraId}');
 
       // ส่ง camera data
       _channel!.sink.add(jsonEncode({
@@ -58,33 +72,59 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
       // รับ binary frames
       _channel!.stream.listen(
         (data) {
-          if (data is Uint8List) {
+          if (data is String) {
+            print('WebSocket message: $data');
             setState(() {
-              _currentImage = data;
+              _streamError = data;
+              _isConnected = false;
+            });
+            return;
+          }
+
+          Uint8List? bytes;
+          if (data is Uint8List) {
+            bytes = data;
+          } else if (data is ByteBuffer) {
+            bytes = data.asUint8List();
+          } else if (data is List<int>) {
+            bytes = Uint8List.fromList(data);
+          }
+
+          if (bytes != null) {
+            setState(() {
+              _currentImage = bytes;
+              _streamError = null;
               _isConnected = true;
               _retryCount = 0;
             });
+          } else {
+            print('Unsupported WebSocket data type: ${data.runtimeType}');
           }
         },
         onError: (error) {
           print('WebSocket error: $error');
-          _handleError();
+          _handleError(error.toString());
         },
         onDone: () {
           print('WebSocket closed');
-          _handleError();
+          _handleError('WebSocket closed');
         },
       );
     } catch (e) {
       print('WebSocket connect error: $e');
-      _handleError();
+      _handleError(e.toString());
     }
   }
 
-  void _handleError() {
+  void _handleError([String? message]) {
     _retryCount++;
-    if (_retryCount >= _maxRetries && _isConnected) {
-      setState(() => _isConnected = false);
+    if (mounted) {
+      setState(() {
+        _isConnected = false;
+        if (_currentImage == null) {
+          _streamError = message;
+        }
+      });
     }
     // Retry after delay
     Future.delayed(Duration(seconds: 2), () {
@@ -104,6 +144,10 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
       if ((username ?? '').isEmpty) {
         throw Exception('ไม่พบข้อมูลผู้ใช้ในระบบ');
       }
+      final slotNumber = await _selectLatestOccupiedSlot();
+      if (slotNumber == null) {
+        return;
+      }
       final response = await http.post(
         buildApiUri('/parking_history/log'),
         headers: buildApiHeaders(jsonBody: true),
@@ -111,6 +155,7 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
           'username': username,
           'camera_id': widget.cameraId,
           'event_type': 'parking_success',
+          'slot_number': slotNumber,
         }),
       );
 
@@ -143,6 +188,70 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
         _isSavingHistory = false;
       });
     }
+  }
+
+  Future<int?> _selectLatestOccupiedSlot() async {
+    final response = await http.get(
+      buildApiUri('/parking_status/latest', queryParameters: {
+        'camera_id': widget.cameraId.toString(),
+      }),
+      headers: buildApiHeaders(),
+    );
+
+    if (response.statusCode != 200) {
+      throw Exception('Cannot load occupied parking slots');
+    }
+
+    final body = jsonDecode(response.body);
+    final slots = (body['slots'] as List<dynamic>? ?? [])
+        .where((slot) => slot['manual_logged'] != true)
+        .toList();
+
+    if (slots.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('ยังไม่พบช่องที่มีรถจอดล่าสุด'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
+      return null;
+    }
+
+    if (!mounted) return null;
+    return showDialog<int>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('เลือกช่องที่รถจอดล่าสุด'),
+          content: SizedBox(
+            width: 320,
+            child: ListView.separated(
+              shrinkWrap: true,
+              itemCount: slots.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (context, index) {
+                final slot = slots[index];
+                final slotNumber = int.tryParse(slot['slot_number'].toString()) ?? 0;
+                final seconds = (slot['occupied_seconds'] as num?)?.round() ?? 0;
+                return ListTile(
+                  title: Text('ช่อง $slotNumber'),
+                  subtitle: Text(index == 0 ? 'รถที่จอดล่าสุด (${seconds}s)' : 'จอดแล้ว ${seconds}s'),
+                  onTap: () => Navigator.of(context).pop(slotNumber),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('ยกเลิก'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   @override
@@ -236,6 +345,17 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
                                 gaplessPlayback: true,
                               ),
                             )
+                          : _streamError != null && _retryCount >= _maxRetries
+                              ? Center(
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(24),
+                                    child: Text(
+                                      _streamError!,
+                                      textAlign: TextAlign.center,
+                                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(color: Colors.white),
+                                    ),
+                                  ),
+                                )
                           : Center(
                               child: Column(
                                 mainAxisAlignment: MainAxisAlignment.center,
@@ -252,8 +372,8 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
                     ),
                   ),
                 ),
-                if (!_isFullScreen) SizedBox(height: 16),
-                if (!_isFullScreen)
+                if (!_isFullScreen && !_isAdmin) SizedBox(height: 16),
+                if (!_isFullScreen && !_isAdmin)
                   ElevatedButton.icon(
                     onPressed: _isSavingHistory ? null : _markParkingSuccess,
                     icon: _isSavingHistory

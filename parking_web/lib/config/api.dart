@@ -2,7 +2,7 @@
 // --dart-define=PARKING_API_BASE_URL=https://your-ngrok-url
 const String _RAW_BASE_URL = String.fromEnvironment(
   'PARKING_API_BASE_URL',
-  defaultValue: 'http://localhost:8000',
+  defaultValue: 'http://127.0.0.1:8000',
 );
 
 final String BASE_URL = _RAW_BASE_URL.replaceFirst(RegExp(r'/+$'), '');
@@ -10,8 +10,11 @@ final String BASE_URL = _RAW_BASE_URL.replaceFirst(RegExp(r'/+$'), '');
 Map<String, String> buildApiHeaders({bool jsonBody = false}) {
   final headers = <String, String>{
     'Accept': 'application/json',
-    'ngrok-skip-browser-warning': 'true',
   };
+
+  if (BASE_URL.contains('ngrok-free.dev')) {
+    headers['ngrok-skip-browser-warning'] = 'true';
+  }
 
   if (jsonBody) {
     headers['Content-Type'] = 'application/json';
