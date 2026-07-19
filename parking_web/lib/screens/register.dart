@@ -26,33 +26,41 @@ class _RegisterScreenState extends State<RegisterScreen> {
   Future<void> _submit() async {
     if (!(_formKey.currentState?.validate() ?? false)) return;
 
-    final url = Uri.parse('$BASE_URL/register');
-    final response = await http.post(
-      url,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'username': _userController.text.trim(),
-        'password': _passController.text.trim(),
-      }),
-    );
+    final url = buildApiUri('/register');
+    try {
+      final response = await http.post(
+        url,
+        headers: buildApiHeaders(jsonBody: true),
+        body: jsonEncode({
+          'username': _userController.text.trim(),
+          'password': _passController.text.trim(),
+        }),
+      );
 
-    if (response.statusCode == 200) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('สมัครสมาชิกเรียบร้อย')));
+      if (response.statusCode == 200) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('สมัครสมาชิกเรียบร้อย')));
 
-      if (!mounted) return;
-      if (Navigator.canPop(context)) {
-        Navigator.pop(context);
+        if (!mounted) return;
+        if (Navigator.canPop(context)) {
+          Navigator.pop(context);
+        } else {
+          Navigator.pushReplacementNamed(context, '/login');
+        }
       } else {
-        Navigator.pushReplacementNamed(context, '/login');
+        final body = jsonDecode(response.body);
+        final message = body['detail'] ?? 'Register failed';
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(message)));
       }
-    } else {
-      final body = jsonDecode(response.body);
-      final message = body['detail'] ?? 'Register failed';
+
+      return;
+    } catch (e) {
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text(message)));
+      ).showSnackBar(SnackBar(content: Text('ไม่สามารถเชื่อมต่อ backend: $e')));
     }
   }
 

@@ -1,7 +1,7 @@
 {
   "framework": null,
   "installCommand": "git clone --depth 1 -b stable https://github.com/flutter/flutter.git /tmp/flutter && /tmp/flutter/bin/flutter --version",
-  "buildCommand": "export PATH=\"/tmp/flutter/bin:$PATH\" && cd parking_web && flutter pub get && flutter build web --release --dart-define=PARKING_API_BASE_URL=$PARKING_API_BASE_URL",
+  "buildCommand": "export PATH=\"/tmp/flutter/bin:$PATH\" && cd parking_web && flutter pub get && flutter build web --release --dart-define=PARKING_API_BASE_URL=${PARKING_API_BASE_URL:-http://68.183.127.62:8000}",
   "outputDirectory": "parking_web/build/web",
   "rewrites": [
     {
