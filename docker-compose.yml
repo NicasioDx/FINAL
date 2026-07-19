@@ -29,9 +29,8 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
-      - ./backend/yolov8n.pt:/app/yolov8n.pt
     restart: unless-stopped
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
 
 volumes:
   postgres_data:

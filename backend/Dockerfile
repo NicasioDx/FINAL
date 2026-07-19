@@ -15,12 +15,17 @@ RUN apt-get update && apt-get install -y \
 
 # Copy requirements และติดตั้ง Python packages
 COPY requirements.txt .
+
+# ติดตั้ง PyTorch แบบ CPU ก่อน เพื่อลดขนาดและหลีกเลี่ยงการดึงชุด CUDA ที่ใหญ่เกินจำเป็น
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.2.2 torchvision==0.17.2
+
+# จากนั้นติดตั้งแพ็กเกจที่เหลือของโปรเจกต์
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy โค้ดทั้งหมด
 COPY . .
 
-# Download YOLOv8 model (ถ้ายังไม่มี)
+# ดาวน์โหลดโมเดล YOLOv8 ล่วงหน้าเพื่อลดเวลาตอนเริ่มระบบ
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" 2>/dev/null || echo "Model will be downloaded at runtime"
 
 # Expose port
