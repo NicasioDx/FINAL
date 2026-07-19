@@ -19,6 +19,7 @@ import random
 import shutil
 from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -57,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def infer_label(image_path: Path) -> str | None:
+def infer_label(image_path: Path) -> Optional[str]:
     text = str(image_path).lower().replace("-", "_")
     if any(key in text for key in EMPTY_KEYWORDS):
         return "empty"

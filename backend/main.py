@@ -14,6 +14,7 @@ import torch
 import functools
 import asyncio
 from contextlib import asynccontextmanager
+from typing import Optional, Tuple, Union
 
 torch.load = functools.partial(torch.load, weights_only=False)
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
@@ -79,7 +80,7 @@ PARKING_AUTO_LOG_SECONDS = float(env_value("PARKING_AUTO_LOG_SECONDS", "10"))
 SLOTS_REFRESH_INTERVAL = int(env_value("SLOTS_REFRESH_INTERVAL", "60"))
 STREAM_SIZE = (640, 360)
 VEHICLE_CLASS_NAMES = {"car", "bus", "truck"}
-Slot = tuple[int, int, int, int] | dict[str, object]
+Slot = Union[Tuple[int, int, int, int], dict[str, object]]
 
 slot_model = None
 vehicle_model = None
@@ -89,7 +90,7 @@ parking_state_lock = threading.Lock()
 parking_state: dict[int, dict[int, dict[str, object]]] = {}
 
 
-def resolve_backend_path(path: str, fallbacks: list[str] | None = None) -> str:
+def resolve_backend_path(path: str, fallbacks: Optional[list[str]] = None) -> str:
     """ค้นหาไฟล์ประกอบให้เจอไม่ว่าจะรัน uvicorn จากโฟลเดอร์ backend/ หรือโฟลเดอร์หลัก"""
     candidates = [path]
     if not os.path.isabs(path):
@@ -171,7 +172,7 @@ def rewind_if_demo_video(cap: cv2.VideoCapture, source: str) -> bool:
     return False
 
 
-def clamp_box(box: tuple[float, float, float, float], width: int, height: int) -> tuple[int, int, int, int] | None:
+def clamp_box(box: tuple[float, float, float, float], width: int, height: int) -> Optional[tuple[int, int, int, int]]:
     x1, y1, x2, y2 = box
     x1 = max(0, min(width - 1, int(round(x1))))
     y1 = max(0, min(height - 1, int(round(y1))))
@@ -190,7 +191,7 @@ def maybe_scale_box(box: tuple[float, float, float, float], width: int, height: 
 
 
 # ตัวช่วยแปลง ROI จากหลายรูปแบบให้เป็นกรอบ/พิกัดช่องจอดมาตรฐานภายในระบบ
-def roi_to_box(roi, width: int, height: int, source_size: tuple[int, int] | None = None) -> tuple[int, int, int, int] | None:
+def roi_to_box(roi, width: int, height: int, source_size: Optional[tuple[int, int]] = None) -> Optional[tuple[int, int, int, int]]:
     points = None
     box = None
 
@@ -237,7 +238,7 @@ def roi_to_box(roi, width: int, height: int, source_size: tuple[int, int] | None
     return clamp_box(box, width, height)
 
 
-def scale_roi_point(point, width: int, height: int, source_size: tuple[int, int] | None = None) -> tuple[int, int] | None:
+def scale_roi_point(point, width: int, height: int, source_size: Optional[tuple[int, int]] = None) -> Optional[tuple[int, int]]:
     try:
         x = float(point[0])
         y = float(point[1])
@@ -258,7 +259,7 @@ def scale_roi_point(point, width: int, height: int, source_size: tuple[int, int]
     return x, y
 
 
-def roi_to_slot(roi, width: int, height: int, source_size: tuple[int, int] | None = None) -> Slot | None:
+def roi_to_slot(roi, width: int, height: int, source_size: Optional[tuple[int, int]] = None) -> Optional[Slot]:
     raw_points = None
     if isinstance(roi, dict):
         raw_points = roi.get("points") or roi.get("polygon") or roi.get("roi")
@@ -351,7 +352,7 @@ def load_camera_manual_slots(camera_id: int, width: int, height: int) -> list[Sl
     return sort_slots(slots)
 
 
-def boxes_from_yolo(result, width: int, height: int, allowed_names: set[str] | None = None) -> list[tuple[int, int, int, int]]:
+def boxes_from_yolo(result, width: int, height: int, allowed_names: Optional[set[str]] = None) -> list[tuple[int, int, int, int]]:
     boxes = []
     names = getattr(result, "names", {}) or {}
     for box in getattr(result, "boxes", []):
@@ -428,7 +429,7 @@ def vehicle_center(vehicle: tuple[int, int, int, int]) -> tuple[float, float]:
     return ((vehicle[0] + vehicle[2]) / 2.0, (vehicle[1] + vehicle[3]) / 2.0)
 
 
-def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> float | None:
+def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> Optional[float]:
     polygon = slot_polygon(slot)
     slot_area = max(1.0, polygon_area(polygon))
     vehicle_area = max(1, (vehicle[2] - vehicle[0]) * (vehicle[3] - vehicle[1]))
@@ -520,9 +521,9 @@ def draw_parking_overlay(frame, slots: list[Slot], vehicles: list[tuple[int, int
 
 def annotate_parking_frame(
     frame,
-    cached_slots: list[Slot] | None = None,
+    cached_slots: Optional[list[Slot]] = None,
     force_slot_refresh: bool = False,
-    camera_id: int | None = None,
+    camera_id: Optional[int] = None,
 ):
     resized_frame = cv2.resize(frame, STREAM_SIZE)
     half_precision = str(device).startswith("cuda")
@@ -603,7 +604,7 @@ def get_latest_occupied_slots(camera_id: int) -> list[dict[str, object]]:
     return sorted(slots, key=lambda item: item["occupied_seconds"])
 
 
-def latest_unlogged_slot_number(camera_id: int) -> int | None:
+def latest_unlogged_slot_number(camera_id: int) -> Optional[int]:
     with parking_state_lock:
         camera_state = parking_state.get(camera_id, {})
         unlogged_slots = {
@@ -769,11 +770,11 @@ class ParkingHistoryLog(BaseModel):
     username: str
     camera_id: int
     event_type: str = "parking_success"
-    slot_number: int | None = None
+    slot_number: Optional[int] = None
 
 
 class RoiMarkerSave(BaseModel):
-    camera_id: int | None = None
+    camera_id: Optional[int] = None
     image_size: list[int]
     rois: list[dict]
 
@@ -1326,7 +1327,7 @@ async def roi_marker_page():
 
 
 @app.get("/roi_marker/data")
-async def roi_marker_data(camera_id: int | None = None):
+async def roi_marker_data(camera_id: Optional[int] = None):
     if camera_id is not None:
         data = get_camera_rois(camera_id)
         if data:
@@ -1352,7 +1353,7 @@ async def roi_marker_data(camera_id: int | None = None):
 
 
 @app.get("/roi_marker/frame")
-async def roi_marker_frame(camera_id: int | None = None, second: float = 50.0):
+async def roi_marker_frame(camera_id: Optional[int] = None, second: float = 50.0):
     if camera_id is not None and not USE_DEMO_VIDEO:
         cam = get_camera_credentials(camera_id)
         if not cam:

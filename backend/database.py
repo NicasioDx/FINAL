@@ -6,7 +6,7 @@ import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 import os
-from typing import TypedDict, Literal
+from typing import TypedDict, Literal, Optional
 from urllib.parse import urlparse
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -430,7 +430,7 @@ def get_camera_rois(camera_id: int):
         release_connection(conn)
 
 
-def add_parking_history(username: str | None, camera_id: int, event_type: str = "parking_success", slot_number: int | None = None) -> bool:
+def add_parking_history(username: Optional[str], camera_id: int, event_type: str = "parking_success", slot_number: Optional[int] = None) -> bool:
     """บันทึกประวัติการเข้าจอด"""
     conn = get_connection()
     if not conn:
