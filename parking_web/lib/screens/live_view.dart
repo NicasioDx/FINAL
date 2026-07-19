@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'dart:typed_data';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../config/api.dart';
 import '../config/session.dart';
 import '../config/theme_controller.dart';
@@ -25,10 +27,12 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
   bool _isFullScreen = false;
   bool _isSavingHistory = false;
   bool _isAdmin = false;
+  bool _showManualRoiPopup = false;
   String? _streamError;
   int _retryCount = 0;
   static const int _maxRetries = 5;
   late final String _serverUrl;
+  final TextEditingController _roiSecondController = TextEditingController(text: '50');
 
   @override
   void initState() {
@@ -43,6 +47,9 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
     if (mounted) {
       setState(() {
         _isAdmin = role == 'admin';
+        if (!_isAdmin) {
+          _showManualRoiPopup = false;
+        }
       });
     }
   }
@@ -256,8 +263,47 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
 
   @override
   void dispose() {
+    _roiSecondController.dispose();
     _channel?.sink.close();
     super.dispose();
+  }
+
+  String _roiMarkerUrl() {
+    return buildApiUri(
+      '/roi_marker',
+      queryParameters: {
+        'camera_id': widget.cameraId.toString(),
+      },
+    ).toString();
+  }
+
+  String _roiFrameUrl() {
+    final second = double.tryParse(_roiSecondController.text.trim()) ?? 50.0;
+    return buildApiUri(
+      '/roi_marker/frame',
+      queryParameters: {
+        'camera_id': widget.cameraId.toString(),
+        'second': second.toStringAsFixed(1),
+      },
+    ).toString();
+  }
+
+  Future<void> _openExternalUrl(String url) async {
+    final uri = Uri.parse(url);
+    final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!opened && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('ไม่สามารถเปิดลิงก์ได้ กรุณาคัดลอกลิงก์ไปเปิดเอง')),
+      );
+    }
+  }
+
+  Future<void> _copyToClipboard(String value, String label) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('คัดลอก$labelแล้ว')),
+    );
   }
 
   @override
@@ -398,25 +444,184 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
               alignment: Alignment.topRight,
               child: Padding(
                 padding: const EdgeInsets.all(12.0),
-                child: Material(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(24),
-                  child: IconButton(
-                    tooltip: _isFullScreen ? 'ออกจากเต็มจอ' : 'เต็มจอ',
-                    icon: Icon(
-                      _isFullScreen ? Icons.fullscreen_exit : Icons.fullscreen,
-                      color: Colors.white,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Material(
+                      color: Colors.black54,
+                      borderRadius: BorderRadius.circular(24),
+                      child: IconButton(
+                        tooltip: _isFullScreen ? 'ออกจากเต็มจอ' : 'เต็มจอ',
+                        icon: Icon(
+                          _isFullScreen ? Icons.fullscreen_exit : Icons.fullscreen,
+                          color: Colors.white,
+                        ),
+                        onPressed: () {
+                          setState(() {
+                            _isFullScreen = !_isFullScreen;
+                          });
+                        },
+                      ),
                     ),
-                    onPressed: () {
-                      setState(() {
-                        _isFullScreen = !_isFullScreen;
-                      });
-                    },
-                  ),
+                  ],
                 ),
               ),
             ),
           ),
+          if (_isAdmin)
+            SafeArea(
+              child: Align(
+                alignment: Alignment.bottomRight,
+                child: Padding(
+                  padding: const EdgeInsets.all(12.0),
+                  child: Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(28),
+                      onTap: () {
+                        setState(() {
+                          _showManualRoiPopup = !_showManualRoiPopup;
+                        });
+                      },
+                      child: Ink(
+                        width: 56,
+                        height: 56,
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(
+                            colors: [Color(0xFF1D4ED8), Color(0xFF4F46E5)],
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                          ),
+                          shape: BoxShape.circle,
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Color(0x332563EB),
+                              blurRadius: 16,
+                              offset: Offset(0, 8),
+                            ),
+                          ],
+                        ),
+                        child: Icon(
+                          _showManualRoiPopup ? Icons.keyboard_arrow_right : Icons.keyboard_arrow_left,
+                          color: Colors.white,
+                          size: 30,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          if (_isAdmin && _showManualRoiPopup)
+            SafeArea(
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: Padding(
+                  padding: const EdgeInsets.only(right: 12, left: 12),
+                  child: SizedBox(
+                    width: 320,
+                    child: Card(
+                      elevation: 8,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                const Icon(Icons.crop_free, color: Colors.indigo),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    'Manual ROI',
+                                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: 'ปิด',
+                                  onPressed: () {
+                                    setState(() {
+                                      _showManualRoiPopup = false;
+                                    });
+                                  },
+                                  icon: const Icon(Icons.close),
+                                )
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              'กล้อง: ${widget.name} (ID: ${widget.cameraId})',
+                              style: Theme.of(context).textTheme.bodyMedium,
+                            ),
+                            const SizedBox(height: 10),
+                            TextField(
+                              controller: _roiSecondController,
+                              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                              decoration: const InputDecoration(
+                                labelText: 'เลือกวินาทีของเฟรม',
+                                hintText: 'เช่น 50.0',
+                                border: OutlineInputBorder(),
+                                isDense: true,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                ElevatedButton.icon(
+                                  onPressed: () => _openExternalUrl(_roiMarkerUrl()),
+                                  icon: const Icon(Icons.open_in_new),
+                                  label: const Text('เปิด ROI Marker'),
+                                ),
+                                OutlinedButton.icon(
+                                  onPressed: () => _openExternalUrl(_roiFrameUrl()),
+                                  icon: const Icon(Icons.image),
+                                  label: const Text('เปิดเฟรมอ้างอิง'),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 10),
+                            Text(
+                              'URL: ${_roiMarkerUrl()}',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                            Text(
+                              'Frame: ${_roiFrameUrl()}',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                            const SizedBox(height: 10),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: OutlinedButton(
+                                    onPressed: () => _copyToClipboard(_roiMarkerUrl(), 'ลิงก์ ROI Marker'),
+                                    child: const Text('คัดลอกลิงก์ ROI'),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: OutlinedButton(
+                                    onPressed: () => _copyToClipboard(_roiFrameUrl(), 'ลิงก์เฟรม'),
+                                    child: const Text('คัดลอกลิงก์เฟรม'),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );

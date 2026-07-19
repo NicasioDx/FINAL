@@ -16,6 +16,103 @@ class CameraListScreen extends StatefulWidget {
 class _CameraListScreenState extends State<CameraListScreen> {
   bool _isAdmin = false;
 
+  Future<void> _deleteCamera(Map<String, dynamic> cam) async {
+    final username = await SessionStore.getUsername();
+    if ((username ?? '').isEmpty) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('ไม่พบข้อมูลผู้ใช้ที่ล็อกอิน')),
+        );
+        return;
+    }
+
+    if (!mounted) return;
+    final passwordController = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('ยืนยันลบกล้อง'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('กล้อง: ${cam['camera_name']}'),
+              const SizedBox(height: 8),
+              const Text('กรอกรหัสผ่านแอดมินเพื่อยืนยันการลบ'),
+              const SizedBox(height: 12),
+              TextField(
+                controller: passwordController,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'รหัสผ่านแอดมิน',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('ยกเลิก'),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              onPressed: () {
+                if (passwordController.text.trim().isEmpty) {
+                  return;
+                }
+                Navigator.pop(context, true);
+              },
+              child: const Text('ลบกล้อง'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed != true) {
+      passwordController.dispose();
+      return;
+    }
+
+    try {
+      final response = await http.post(
+        buildApiUri('/delete_camera'),
+        headers: buildApiHeaders(jsonBody: true),
+        body: jsonEncode({
+          'camera_id': cam['id'],
+          'username': username,
+          'password': passwordController.text,
+        }),
+      );
+
+      if (!mounted) return;
+      if (response.statusCode == 200) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('ลบกล้อง ${cam['camera_name']} สำเร็จ')),
+        );
+        setState(() {});
+      } else {
+        String message = 'ลบกล้องไม่สำเร็จ';
+        try {
+          final body = jsonDecode(response.body);
+          message = body['detail']?.toString() ?? message;
+        } catch (_) {}
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message)),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('เกิดข้อผิดพลาด: $e')),
+      );
+    } finally {
+      passwordController.dispose();
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -196,7 +293,18 @@ class _CameraListScreenState extends State<CameraListScreen> {
                       Text("โซน: ${cam['zone_name'] ?? 'ทั่วไป'}"),
                     ],
                   ),
-                  trailing: Icon(Icons.arrow_forward_ios),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_isAdmin)
+                        IconButton(
+                          tooltip: 'ลบกล้อง',
+                          icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+                          onPressed: () => _deleteCamera(Map<String, dynamic>.from(cam)),
+                        ),
+                      const Icon(Icons.arrow_forward_ios),
+                    ],
+                  ),
                   onTap: () {
                     Navigator.push(
                       context,
@@ -217,7 +325,12 @@ class _CameraListScreenState extends State<CameraListScreen> {
       ),
       floatingActionButton: _isAdmin
           ? FloatingActionButton(
-              onPressed: () => Navigator.pushNamed(context, '/add'),
+              onPressed: () async {
+                await Navigator.pushNamed(context, '/add');
+                if (!mounted) return;
+                // Rebuild once after returning from add camera page to fetch latest list.
+                setState(() {});
+              },
               tooltip: 'เพิ่มกล้องใหม่',
               child: const Icon(Icons.add),
             )

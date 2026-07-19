@@ -142,14 +142,14 @@
 </head>
 <body>
   <header>
-    <h1>Parking ROI Marker</h1>
+    <h1 id="pageTitle">Parking ROI Marker</h1>
     <div class="toolbar">
       <label>Frame second <input id="secondInput" type="number" value="50" min="0" step="1"></label>
       <button id="reloadBtn">Reload frame</button>
       <button id="undoPointBtn">Undo point</button>
       <button id="undoSlotBtn">Undo slot</button>
       <button id="clearBtn" class="danger">Clear</button>
-      <button id="saveBtn" class="primary">Save manual_rois.json</button>
+      <button id="saveBtn" class="primary">Save ROI</button>
     </div>
   </header>
 
@@ -169,11 +169,18 @@
     const statusEl = document.getElementById('status');
     const slotListEl = document.getElementById('slotList');
     const secondInput = document.getElementById('secondInput');
+    const pageTitleEl = document.getElementById('pageTitle');
 
     const image = new Image();
     let rois = [];
     let current = [];
     const imageSize = [960, 540];
+    const params = new URLSearchParams(window.location.search);
+    const cameraId = params.get('camera_id');
+
+    if (cameraId) {
+      pageTitleEl.textContent = `Parking ROI Marker - Camera ${cameraId}`;
+    }
 
     function setStatus(text) {
       statusEl.textContent = text;
@@ -266,7 +273,8 @@
     }
 
     async function loadData() {
-      const response = await fetch('/roi_marker/data');
+      const url = cameraId ? `/roi_marker/data?camera_id=${encodeURIComponent(cameraId)}` : '/roi_marker/data';
+      const response = await fetch(url);
       if (!response.ok) throw new Error(await response.text());
       const data = await response.json();
       rois = Array.isArray(data.rois) ? data.rois.filter(roi => Array.isArray(roi.points)) : [];
@@ -283,11 +291,17 @@
       const response = await fetch('/roi_marker/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image_size: imageSize, rois })
+        body: JSON.stringify({
+          camera_id: cameraId ? Number(cameraId) : null,
+          image_size: imageSize,
+          rois
+        })
       });
       if (!response.ok) throw new Error(await response.text());
       const data = await response.json();
-      setStatus(`Saved ${data.slots} slots to manual_rois.json`);
+      setStatus(data.scope === 'camera'
+        ? `Saved ${data.slots} slots for camera ${data.camera_id}`
+        : `Saved ${data.slots} slots to manual_rois.json`);
     }
 
     canvas.addEventListener('click', event => addPoint(canvasPoint(event)));

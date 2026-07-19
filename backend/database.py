@@ -1,5 +1,6 @@
 import hashlib
 import base64
+import json
 import bcrypt
 import psycopg2
 from psycopg2 import pool
@@ -167,6 +168,16 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_parking_history_created ON parking_history(created_at DESC);
     """
 
+    camera_roi_query = """
+    CREATE TABLE IF NOT EXISTS camera_rois (
+        camera_id INTEGER PRIMARY KEY,
+        image_size TEXT NOT NULL,
+        rois TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(camera_id) REFERENCES cameras(id) ON DELETE CASCADE
+    );
+    """
+
     conn = get_connection()
     if conn:
         cur = None
@@ -175,6 +186,7 @@ def init_db():
             cur.execute(camera_query)
             cur.execute(user_query)
             cur.execute(parking_history_query)
+            cur.execute(camera_roi_query)
             # Ensure encrypted camera password tokens can be stored.
             cur.execute("ALTER TABLE cameras ALTER COLUMN password TYPE TEXT")
             # Add columns if they don't exist (for existing tables)
@@ -199,21 +211,22 @@ def add_camera_to_db(name, ip, user, pw, zone_name="ทั่วไป"):
             encrypted_pw = encrypt_camera_password(pw)
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO cameras (camera_name, ip_address, username, password, zone_name) VALUES (%s, %s, %s, %s, %s)",
+                "INSERT INTO cameras (camera_name, ip_address, username, password, zone_name) VALUES (%s, %s, %s, %s, %s) RETURNING id",
                 (name, ip, user, encrypted_pw, zone_name)
             )
+            camera_id = cur.fetchone()[0]
             conn.commit()
-            return True
+            return camera_id
         except Exception as e:
             print(f"Error adding camera: {e}")
             if conn:
                 conn.rollback()
-            return False
+            return None
         finally:
             if cur:
                 cur.close()
             release_connection(conn)
-    return False
+    return None
 
 
 def get_all_cameras():
@@ -263,6 +276,28 @@ def get_camera_credentials(camera_id: int):
                 cur.close()
             release_connection(conn)
     return None
+
+
+def delete_camera_from_db(camera_id: int) -> bool:
+    conn = get_connection()
+    if not conn:
+        return False
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM cameras WHERE id=%s", (camera_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        return deleted
+    except Exception as e:
+        print(f"Error deleting camera: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if cur:
+            cur.close()
+        release_connection(conn)
 
 
 def create_user(username: str, password: str, role: str = "customer") -> UserActionResult:
@@ -327,6 +362,74 @@ def authenticate_user(username: str, password: str) -> UserActionResult:
         release_connection(conn)
 
 
+def save_camera_rois(camera_id: int, image_size: list[int], rois: list[dict]) -> bool:
+    conn = get_connection()
+    if not conn:
+        return False
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO camera_rois (camera_id, image_size, rois, updated_at)
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (camera_id)
+            DO UPDATE SET image_size = EXCLUDED.image_size,
+                          rois = EXCLUDED.rois,
+                          updated_at = CURRENT_TIMESTAMP
+            """,
+            (camera_id, json.dumps(image_size), json.dumps(rois)),
+        )
+        conn.commit()
+        return True
+    except Exception as exc:
+        print(f"Error saving camera ROIs: {exc}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if cur:
+            cur.close()
+        release_connection(conn)
+
+
+def get_camera_rois(camera_id: int):
+    conn = get_connection()
+    if not conn:
+        return None
+    cur = None
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            "SELECT image_size, rois, updated_at FROM camera_rois WHERE camera_id=%s",
+            (camera_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+
+        image_size = row.get("image_size")
+        rois = row.get("rois")
+        if isinstance(image_size, str):
+            image_size = json.loads(image_size)
+        if isinstance(rois, str):
+            rois = json.loads(rois)
+
+        return {
+            "camera_id": camera_id,
+            "image_size": image_size or [960, 540],
+            "rois": rois or [],
+            "updated_at": row.get("updated_at"),
+        }
+    except Exception as exc:
+        print(f"Error fetching camera ROIs: {exc}")
+        return None
+    finally:
+        if cur:
+            cur.close()
+        release_connection(conn)
+
+
 def add_parking_history(username: str | None, camera_id: int, event_type: str = "parking_success", slot_number: int | None = None) -> bool:
     """บันทึกประวัติการเข้าจอด"""
     conn = get_connection()
@@ -358,7 +461,53 @@ def add_parking_history(username: str | None, camera_id: int, event_type: str = 
         release_connection(conn)
 
 
-def get_parking_history(username: str = None, zone_name: str = None, limit: int = 100) -> list:
+def promote_latest_anonymous_auto_history(
+    username: str,
+    camera_id: int,
+    slot_number: int,
+    event_type: str = "parking_success",
+) -> bool:
+    """Promote the latest anonymous auto-detected parking record into a user record."""
+    conn = get_connection()
+    if not conn:
+        return False
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE parking_history "
+            "SET username=%s, event_type=%s "
+            "WHERE id = ("
+            "    SELECT id FROM parking_history "
+            "    WHERE camera_id=%s "
+            "      AND slot_number=%s "
+            "      AND event_type='parking_auto' "
+            "      AND username IS NULL "
+            "    ORDER BY created_at DESC, id DESC "
+            "    LIMIT 1"
+            ")",
+            (username, event_type, camera_id, slot_number),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+        return updated
+    except Exception as e:
+        print(f"Error promoting anonymous auto history: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if cur:
+            cur.close()
+        release_connection(conn)
+
+
+def get_parking_history(
+    username: str = None,
+    zone_name: str = None,
+    limit: int = 100,
+    min_anonymous_auto_age_seconds: float = 0,
+) -> list:
     """ดึงประวัติการเข้าจอด"""
     conn = get_connection()
     if not conn:
@@ -382,6 +531,15 @@ def get_parking_history(username: str = None, zone_name: str = None, limit: int 
         if zone_name:
             query += " AND ph.zone_name=%s"
             params.append(zone_name)
+
+        if min_anonymous_auto_age_seconds > 0:
+            query += (
+                " AND NOT (ph.username IS NULL"
+                " AND ph.event_type='parking_auto'"
+                " AND ph.created_at > NOW() - (%s * INTERVAL '1 second'))"
+                ")"
+            )
+            params.append(float(min_anonymous_auto_age_seconds))
 
         query += " ORDER BY ph.created_at DESC LIMIT %s"
         params.append(limit)

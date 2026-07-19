@@ -1,5 +1,5 @@
 ﻿import os
-# âœ… à¸šà¸£à¸£à¸—à¸±à¸”à¸—à¸µà¹ˆà¸ªà¸³à¸„à¸±à¸à¸—à¸µà¹ˆà¸ªà¸¸à¸”: à¸•à¹‰à¸­à¸‡à¸­à¸¢à¸¹à¹ˆà¸à¹ˆà¸­à¸™ import torch à¸«à¸£à¸·à¸­ ultralytics
+# ต้องตั้งค่านี้ก่อน import torch/ultralytics เพื่อหลีกเลี่ยงข้อจำกัดการโหลดน้ำหนักโมเดล
 os.environ["TORCH_FORCE_WEIGHTS_ONLY_LOAD"] = "0"
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -22,21 +22,35 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 import uvicorn
 from ultralytics import YOLO 
-from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaPlayer
+AIORTC_AVAILABLE = True
+AIORTC_IMPORT_ERROR = ""
+try:
+    from aiortc import RTCPeerConnection, RTCSessionDescription
+    from aiortc.contrib.media import MediaPlayer
+except Exception as exc:
+    # บางเครื่อง Windows อาจบล็อก DLL ของ aiortc/av ด้วยนโยบาย App Control
+    AIORTC_AVAILABLE = False
+    AIORTC_IMPORT_ERROR = str(exc)
+    RTCPeerConnection = None
+    RTCSessionDescription = None
+    MediaPlayer = None
 
-# à¸™à¸³à¹€à¸‚à¹‰à¸²à¸Ÿà¸±à¸‡à¸à¹Œà¸Šà¸±à¸™à¸ˆà¸²à¸ database.py
+# ฟังก์ชันช่วยเข้าถึงฐานข้อมูลที่ใช้ใน API และงานประมวลผลสตรีม
 from database import (
     init_db, add_camera_to_db, get_all_cameras, create_user, authenticate_user,
     get_connection, release_connection, get_camera_credentials,
-    add_parking_history, get_parking_history, get_user_role
+    add_parking_history, get_parking_history, get_user_role,
+    get_camera_rois, save_camera_rois, delete_camera_from_db,
+    promote_latest_anonymous_auto_history
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("parking_backend")
+if not AIORTC_AVAILABLE:
+    logger.warning("WEBRTC_DISABLED reason=%s", AIORTC_IMPORT_ERROR)
 
-# --- Demo video mode ---------------------------------------------------------
-# à¹ƒà¸Šà¹‰à¸ªà¸³à¸«à¸£à¸±à¸šà¹€à¸”à¹‚à¸¡à¹à¸—à¸™à¸à¸¥à¹‰à¸­à¸‡à¸ˆà¸£à¸´à¸‡: à¸•à¸±à¹‰à¸‡ USE_DEMO_VIDEO=true à¹à¸¥à¹‰à¸§à¸§à¸²à¸‡à¸§à¸´à¸”à¸µà¹‚à¸­à¹„à¸§à¹‰à¸—à¸µà¹ˆ DEMO_VIDEO_PATH
+# --- โหมดวิดีโอตัวอย่าง ------------------------------------------------------
+# ตั้ง USE_DEMO_VIDEO=true เพื่ออ่านเฟรมจากไฟล์แทนกล้อง RTSP จริง
 TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 
 
@@ -64,7 +78,7 @@ OCCUPIED_SLOT_THRESHOLD = float(env_value("OCCUPIED_SLOT_THRESHOLD", "0.70"))
 PARKING_AUTO_LOG_SECONDS = float(env_value("PARKING_AUTO_LOG_SECONDS", "10"))
 SLOTS_REFRESH_INTERVAL = int(env_value("SLOTS_REFRESH_INTERVAL", "60"))
 STREAM_SIZE = (640, 360)
-VEHICLE_CLASS_NAMES = {"car", "motorcycle", "bus", "truck"}
+VEHICLE_CLASS_NAMES = {"car", "bus", "truck"}
 Slot = tuple[int, int, int, int] | dict[str, object]
 
 slot_model = None
@@ -76,7 +90,7 @@ parking_state: dict[int, dict[int, dict[str, object]]] = {}
 
 
 def resolve_backend_path(path: str, fallbacks: list[str] | None = None) -> str:
-    """Resolve repo assets whether uvicorn starts from backend/ or project root."""
+    """ค้นหาไฟล์ประกอบให้เจอไม่ว่าจะรัน uvicorn จากโฟลเดอร์ backend/ หรือโฟลเดอร์หลัก"""
     candidates = [path]
     if not os.path.isabs(path):
         candidates.append(os.path.join(BASE_DIR, path))
@@ -99,7 +113,7 @@ def writable_backend_path(path: str) -> str:
 
 
 def is_file_source(source: str) -> bool:
-    """True à¹€à¸¡à¸·à¹ˆà¸­ source à¹€à¸›à¹‡à¸™à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­ à¹„à¸¡à¹ˆà¹ƒà¸Šà¹ˆ RTSP/HTTP stream."""
+    """คืนค่า True เมื่อ source เป็นไฟล์ในเครื่อง ไม่ใช่ RTSP/HTTP"""
     lower = str(source).lower()
     return not (lower.startswith("rtsp://") or lower.startswith("http://") or lower.startswith("https://"))
 
@@ -108,15 +122,38 @@ def build_rtsp_url(username: str, password: str, ip: str) -> str:
     return f"rtsp://{username}:{password}@{ip}:554/stream2"
 
 
+def _resolve_demo_video_source(ip: str = "") -> str:
+    """ค้นหา path วิดีโอตัวอย่างรายกล้องเมื่อ USE_DEMO_VIDEO=true
+
+    รองรับรูปแบบ ip ในแถวกล้องดังนี้:
+    - video:videos/file.mp4
+    - file:videos/file.mp4
+    - path ปกติแบบ relative/absolute ที่ลงท้ายด้วยนามสกุลวิดีโอ
+    """
+    value = (ip or "").strip()
+    if value:
+        lowered = value.lower()
+        prefixes = ("video:", "file:")
+        if lowered.startswith(prefixes):
+            raw_path = value.split(":", 1)[1].strip()
+            if raw_path:
+                return resolve_backend_path(raw_path)
+
+        if lowered.endswith((".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v")):
+            return resolve_backend_path(value)
+
+    return resolve_backend_path(DEMO_VIDEO_PATH)
+
+
 def get_stream_source(ip: str = "", username: str = "", password: str = "") -> str:
-    """à¸„à¸·à¸™à¸„à¹ˆà¸² source à¸—à¸µà¹ˆ OpenCV/MediaPlayer à¹ƒà¸Šà¹‰à¹€à¸›à¸´à¸”: demo mp4 à¸«à¸£à¸·à¸­ RTSP à¸ˆà¸£à¸´à¸‡."""
+    """คืนค่า URL หรือ path ของแหล่งภาพที่จะให้ OpenCV/MediaPlayer เปิดใช้งาน"""
     if USE_DEMO_VIDEO:
-        return resolve_backend_path(DEMO_VIDEO_PATH)
+        return _resolve_demo_video_source(ip=ip)
     return build_rtsp_url(username=username, password=password, ip=ip)
 
 
 def open_video_capture(source: str) -> cv2.VideoCapture:
-    """à¹€à¸›à¸´à¸”à¸§à¸´à¸”à¸µà¹‚à¸­/à¸à¸¥à¹‰à¸­à¸‡ à¹‚à¸”à¸¢à¹ƒà¸Šà¹‰ FFMPEG à¹€à¸‰à¸žà¸²à¸° RTSP."""
+    """เปิดตัวรับภาพและตั้งค่าพิเศษของ FFMPEG เมื่อเป็น RTSP"""
     if is_file_source(source):
         cap = cv2.VideoCapture(source)
     else:
@@ -127,7 +164,7 @@ def open_video_capture(source: str) -> cv2.VideoCapture:
 
 
 def rewind_if_demo_video(cap: cv2.VideoCapture, source: str) -> bool:
-    """à¸–à¹‰à¸²à¹€à¸›à¹‡à¸™à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­à¹à¸¥à¸°à¸­à¹ˆà¸²à¸™à¸ˆà¸š à¹ƒà¸«à¹‰à¸¢à¹‰à¸­à¸™à¸à¸¥à¸±à¸šà¹„à¸›à¹€à¸Ÿà¸£à¸¡à¹à¸£à¸ à¹à¸¥à¹‰à¸§à¸„à¸·à¸™à¸„à¹ˆà¸² True."""
+    """หากเป็นไฟล์วิดีโอและอ่านจนจบ ให้ย้อนกลับไปเฟรมแรกเพื่อวนลูป"""
     if USE_DEMO_VIDEO or is_file_source(source):
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         return True
@@ -152,6 +189,7 @@ def maybe_scale_box(box: tuple[float, float, float, float], width: int, height: 
     return box
 
 
+# ตัวช่วยแปลง ROI จากหลายรูปแบบให้เป็นกรอบ/พิกัดช่องจอดมาตรฐานภายในระบบ
 def roi_to_box(roi, width: int, height: int, source_size: tuple[int, int] | None = None) -> tuple[int, int, int, int] | None:
     points = None
     box = None
@@ -259,6 +297,7 @@ def sort_slots(slots: list[Slot]) -> list[Slot]:
     return sorted(slots, key=lambda slot: (slot_box(slot)[1] // 30, slot_box(slot)[0]))
 
 
+# การโหลดช่องจอดจะใช้ ROI ของกล้องนั้นก่อน แล้วค่อย fallback ไป ROI กลางถ้าเปิดใช้งาน
 def load_manual_slots(width: int, height: int) -> list[Slot]:
     path = resolve_backend_path(MANUAL_ROI_PATH)
     if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -282,6 +321,28 @@ def load_manual_slots(width: int, height: int) -> list[Slot]:
         rois = data.get("rois") or data.get("slots") or data.get("parking_slots") or data.get("manual_rois") or []
 
     slots = []
+    for roi in rois if isinstance(rois, list) else []:
+        slot = roi_to_slot(roi, width, height, source_size)
+        if slot:
+            slots.append(slot)
+
+    return sort_slots(slots)
+
+
+def load_camera_manual_slots(camera_id: int, width: int, height: int) -> list[Slot]:
+    camera_rois = get_camera_rois(camera_id)
+    if not camera_rois:
+        return []
+
+    source_size = None
+    raw_size = camera_rois.get("image_size")
+    if isinstance(raw_size, dict):
+        source_size = (int(raw_size.get("width", 0)), int(raw_size.get("height", 0)))
+    elif isinstance(raw_size, (list, tuple)) and len(raw_size) >= 2:
+        source_size = (int(raw_size[0]), int(raw_size[1]))
+
+    slots: list[Slot] = []
+    rois = camera_rois.get("rois") or []
     for roi in rois if isinstance(rois, list) else []:
         slot = roi_to_slot(roi, width, height, source_size)
         if slot:
@@ -343,6 +404,7 @@ def detect_vehicles(frame, half_precision: bool) -> list[tuple[int, int, int, in
     return boxes_from_yolo(result, width, height, VEHICLE_CLASS_NAMES)
 
 
+# กติกาจับคู่รถกับช่องจะนับว่าจอดก็ต่อเมื่อผ่านเงื่อนไขทับซ้อน/จุดกึ่งกลาง
 def intersection_area(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
     x1 = max(a[0], b[0])
     y1 = max(a[1], b[1])
@@ -362,34 +424,72 @@ def polygon_area(points: list[tuple[int, int]]) -> float:
     return float(cv2.contourArea(np.array(points, dtype=np.float32)))
 
 
-def is_slot_occupied(slot: Slot, vehicles: list[tuple[int, int, int, int]]) -> bool:
+def vehicle_center(vehicle: tuple[int, int, int, int]) -> tuple[float, float]:
+    return ((vehicle[0] + vehicle[2]) / 2.0, (vehicle[1] + vehicle[3]) / 2.0)
+
+
+def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> float | None:
     polygon = slot_polygon(slot)
     slot_area = max(1.0, polygon_area(polygon))
-    for vehicle in vehicles:
-        vehicle_area = max(1, (vehicle[2] - vehicle[0]) * (vehicle[3] - vehicle[1]))
-        vehicle_polygon = [(vehicle[0], vehicle[1]), (vehicle[2], vehicle[1]), (vehicle[2], vehicle[3]), (vehicle[0], vehicle[3])]
-        overlap_area = convex_intersection_area(polygon, vehicle_polygon)
-        vehicle_overlap_ratio = overlap_area / vehicle_area
-        slot_overlap_ratio = overlap_area / slot_area
-        if vehicle_overlap_ratio >= OCCUPIED_THRESHOLD or slot_overlap_ratio >= OCCUPIED_SLOT_THRESHOLD:
-            return True
-    return False
+    vehicle_area = max(1, (vehicle[2] - vehicle[0]) * (vehicle[3] - vehicle[1]))
+    vehicle_polygon = [(vehicle[0], vehicle[1]), (vehicle[2], vehicle[1]), (vehicle[2], vehicle[3]), (vehicle[0], vehicle[3])]
+    overlap_area = convex_intersection_area(polygon, vehicle_polygon)
+
+    if overlap_area <= 0:
+        return None
+
+    vehicle_overlap_ratio = overlap_area / vehicle_area
+    slot_overlap_ratio = overlap_area / slot_area
+    center_x, center_y = vehicle_center(vehicle)
+    contour = np.array(polygon, dtype=np.int32)
+    center_in_slot = cv2.pointPolygonTest(contour, (center_x, center_y), False) >= 0
+
+    is_candidate = (
+        vehicle_overlap_ratio >= OCCUPIED_THRESHOLD
+        or slot_overlap_ratio >= OCCUPIED_SLOT_THRESHOLD
+        or (center_in_slot and slot_overlap_ratio >= 0.05)
+    )
+
+    if not is_candidate:
+        return None
+
+    return (slot_overlap_ratio * 0.65) + (vehicle_overlap_ratio * 0.35) + (0.25 if center_in_slot else 0.0)
+
+
+def assign_occupied_slots(slots: list[Slot], vehicles: list[tuple[int, int, int, int]]) -> set[int]:
+    """จับคู่รถแต่ละคันได้สูงสุดหนึ่งช่อง เพื่อกันการนับรถคันเดียวซ้ำหลายช่อง"""
+    candidates: list[tuple[float, int, int]] = []
+    for slot_idx, slot in enumerate(slots):
+        for vehicle_idx, vehicle in enumerate(vehicles):
+            score = slot_vehicle_match_score(slot, vehicle)
+            if score is not None:
+                candidates.append((score, slot_idx, vehicle_idx))
+
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    used_slots: set[int] = set()
+    used_vehicles: set[int] = set()
+
+    for _, slot_idx, vehicle_idx in candidates:
+        if slot_idx in used_slots or vehicle_idx in used_vehicles:
+            continue
+        used_slots.add(slot_idx)
+        used_vehicles.add(vehicle_idx)
+
+    return used_slots
 
 
 def draw_parking_overlay(frame, slots: list[Slot], vehicles: list[tuple[int, int, int, int]]):
     annotated = frame.copy()
-    occupied_count = 0
-    occupied_slots = []
+    occupied_slot_indexes = assign_occupied_slots(slots, vehicles)
+    occupied_slots = sorted(index + 1 for index in occupied_slot_indexes)
+    occupied_count = len(occupied_slots)
 
     if DRAW_VEHICLE_BOXES:
         for vehicle in vehicles:
             cv2.rectangle(annotated, (vehicle[0], vehicle[1]), (vehicle[2], vehicle[3]), (255, 180, 0), 1)
 
     for index, slot in enumerate(slots, start=1):
-        occupied = is_slot_occupied(slot, vehicles)
-        occupied_count += 1 if occupied else 0
-        if occupied:
-            occupied_slots.append(index)
+        occupied = (index - 1) in occupied_slot_indexes
         color = (0, 0, 255) if occupied else (0, 190, 0)
         box = slot_box(slot)
         points = np.array(slot_polygon(slot), dtype=np.int32)
@@ -418,21 +518,33 @@ def draw_parking_overlay(frame, slots: list[Slot], vehicles: list[tuple[int, int
     return annotated, {"total": len(slots), "occupied": occupied_count, "empty": empty_count, "occupied_slots": occupied_slots}
 
 
-def annotate_parking_frame(frame, cached_slots: list[Slot] | None = None, force_slot_refresh: bool = False):
+def annotate_parking_frame(
+    frame,
+    cached_slots: list[Slot] | None = None,
+    force_slot_refresh: bool = False,
+    camera_id: int | None = None,
+):
     resized_frame = cv2.resize(frame, STREAM_SIZE)
     half_precision = str(device).startswith("cuda")
     slots = cached_slots or []
 
     if force_slot_refresh or not slots:
-        slots = detect_slots(resized_frame, half_precision)
-        if not slots and USE_MANUAL_ROI_FALLBACK:
-            slots = load_manual_slots(*STREAM_SIZE)
+        camera_roi_defined = False
+        if camera_id is not None:
+            camera_roi_defined = get_camera_rois(camera_id) is not None
+            slots = load_camera_manual_slots(camera_id, *STREAM_SIZE)
+
+        if not slots and not camera_roi_defined:
+            slots = detect_slots(resized_frame, half_precision)
+            if not slots and USE_MANUAL_ROI_FALLBACK:
+                slots = load_manual_slots(*STREAM_SIZE)
 
     vehicles = detect_vehicles(resized_frame, half_precision)
     annotated_frame, stats = draw_parking_overlay(resized_frame, slots, vehicles)
     return annotated_frame, slots, stats
 
 
+# สถานะช่องจอดแบบเรียลไทม์ใช้ติดตามระยะเวลาครอบครองและสร้างเหตุการณ์เข้า/ออก
 def update_parking_state(camera_id: int, occupied_slots: list[int]) -> tuple[list[int], list[dict[str, object]]]:
     now = time.time()
     auto_log_slots: list[int] = []
@@ -534,7 +646,7 @@ def mark_manual_logged(camera_id: int, slot_number: int, username: str) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # à¹‚à¸«à¸¥à¸”à¹‚à¸¡à¹€à¸”à¸¥ YOLOv8n
+    # โหลดโมเดล AI ตอนเริ่มระบบ
     global model, slot_model, vehicle_model
     import torch
     global device
@@ -546,14 +658,41 @@ async def lifespan(app: FastAPI):
             logger.warning("AI_DEVICE=%s requested but CUDA is not available; falling back to CPU", AI_DEVICE)
     else:
         device = AI_DEVICE
-    slot_path = resolve_backend_path(SLOT_MODEL_PATH, ["best.pt"])
-    vehicle_path = resolve_backend_path(VEHICLE_MODEL_PATH, ["yolov8s.pt"])
-    slot_model = YOLO(slot_path) if USE_AUTO_SLOT else None
-    vehicle_model = YOLO(vehicle_path)
+    slot_path = resolve_backend_path(SLOT_MODEL_PATH, ["best.pt", "yolov8n.pt"])
+    vehicle_path = resolve_backend_path(VEHICLE_MODEL_PATH, ["yolov8s.pt", "yolov8n.pt"])
+
+    def _load_model_with_fallback(local_path: str, configured_value: str, model_name: str):
+        if os.path.exists(local_path):
+            return YOLO(local_path)
+        # รองรับชื่อโมเดลสำเร็จรูปของ Ultralytics (เช่น yolov8n.pt) ให้ดาวน์โหลดอัตโนมัติ
+        if (
+            configured_value
+            and os.path.basename(configured_value) == configured_value
+            and configured_value.lower().endswith(".pt")
+        ):
+            logger.warning("%s_LOCAL_FILE_MISSING trying_pretrained=%s", model_name, configured_value)
+            return YOLO(configured_value)
+        raise FileNotFoundError(f"Model file not found: {local_path}")
+
+    if USE_AUTO_SLOT:
+        try:
+            slot_model = _load_model_with_fallback(slot_path, SLOT_MODEL_PATH, "AUTO_SLOT")
+        except Exception as exc:
+            logger.warning("AUTO_SLOT_DISABLED reason=%s path=%s", exc, slot_path)
+            slot_model = None
+    else:
+        slot_model = None
+
+    try:
+        vehicle_model = _load_model_with_fallback(vehicle_path, VEHICLE_MODEL_PATH, "VEHICLE_MODEL")
+    except Exception as exc:
+        logger.warning("VEHICLE_MODEL_DISABLED reason=%s path=%s", exc, vehicle_path)
+        vehicle_model = None
+
     model = vehicle_model
-    print(f"âœ… YOLO model loaded on {device}")
+    print(f"âœ… AI components initialized on {device}")
     
-    # à¸£à¸­à¸à¸²à¸™à¸‚à¹‰à¸­à¸¡à¸¹à¸¥à¸žà¸£à¹‰à¸­à¸¡à¸à¹ˆà¸­à¸™ init
+    # รอให้ฐานข้อมูลพร้อมก่อนเริ่มต้นระบบ
     max_retries = int(env_value("DB_STARTUP_RETRIES", "1"))
     for i in range(max_retries):
         try:
@@ -570,7 +709,7 @@ async def lifespan(app: FastAPI):
         yield
         return
 
-    # Init database tables
+    # สร้าง/อัปเดตโครงสร้างตารางที่จำเป็น
     try:
         init_db()
         print("Database initialized")
@@ -580,17 +719,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# à¸›à¸¥à¸”à¸¥à¹‡à¸­à¸ CORS - à¸¢à¸­à¸¡à¸£à¸±à¸šà¸—à¸¸à¸ origin
+# เปิด CORS ให้ทุก origin เพื่อรองรับการเรียกจากส่วนหน้า
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # à¸¢à¸­à¸¡à¸£à¸±à¸šà¸—à¸¸à¸ domain/origin
+    allow_origins=["*"],  # อนุญาตทุก domain/origin
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# --- Models ---
+# --- โมเดลข้อมูลรับ-ส่งของ API ---
 class CameraRegister(BaseModel):
     camera_name: str
     ip: str
@@ -606,6 +745,12 @@ class CameraRequest(BaseModel):
 
 class CameraByIdRequest(BaseModel):
     camera_id: int
+
+
+class CameraDeleteRequest(BaseModel):
+    camera_id: int
+    username: str
+    password: str
 
 class WebRTCOffer(BaseModel):
     sdp: str
@@ -628,10 +773,11 @@ class ParkingHistoryLog(BaseModel):
 
 
 class RoiMarkerSave(BaseModel):
+    camera_id: int | None = None
     image_size: list[int]
     rois: list[dict]
 
-# --- User Management ---
+# --- จัดการผู้ใช้ ---
 
 @app.post("/register")
 async def register(data: UserRegister):
@@ -699,11 +845,11 @@ async def login(data: UserLogin):
     raise HTTPException(status_code=500, detail=result["message"])
 
 
-# --- Parking History Management ---
+# --- จัดการประวัติการจอด ---
 
 @app.post("/parking_history/log")
 async def log_parking_history(data: ParkingHistoryLog):
-    """à¸šà¸±à¸™à¸—à¸¶à¸à¸›à¸£à¸°à¸§à¸±à¸•à¸´à¸à¸²à¸£à¹€à¸‚à¹‰à¸²à¸ˆà¸­à¸”"""
+    """บันทึกประวัติการจอดรถ"""
     slot_number = data.slot_number
     if slot_number is None:
         slot_number = latest_unlogged_slot_number(data.camera_id)
@@ -712,7 +858,17 @@ async def log_parking_history(data: ParkingHistoryLog):
     if not mark_manual_logged(data.camera_id, slot_number, data.username):
         raise HTTPException(status_code=409, detail="Selected slot is not the latest occupied slot or was already logged")
 
-    success = add_parking_history(data.username, data.camera_id, data.event_type, slot_number)
+    success = False
+    if data.event_type == "parking_success":
+        success = promote_latest_anonymous_auto_history(
+            data.username,
+            data.camera_id,
+            slot_number,
+            data.event_type,
+        )
+
+    if not success:
+        success = add_parking_history(data.username, data.camera_id, data.event_type, slot_number)
     
     if success:
         logger.info("PARKING_LOG_SUCCESS username=%s camera_id=%s", data.username, data.camera_id)
@@ -729,7 +885,7 @@ async def latest_parking_status(camera_id: int):
 
 @app.get("/parking_history")
 async def get_user_parking_history(username: str, limit: int = 100):
-    """à¸”à¸¶à¸‡à¸›à¸£à¸°à¸§à¸±à¸•à¸´à¸à¸²à¸£à¹€à¸‚à¹‰à¸²à¸ˆà¸­à¸”à¸‚à¸­à¸‡à¸œà¸¹à¹‰à¹ƒà¸Šà¹‰"""
+    """ดึงประวัติการจอดของผู้ใช้"""
     try:
         history = get_parking_history(username=username, limit=limit)
         return {"status": "success", "data": history}
@@ -740,21 +896,34 @@ async def get_user_parking_history(username: str, limit: int = 100):
 
 @app.get("/parking_history/admin")
 async def get_admin_parking_history(zone_name: str = None, limit: int = 100):
-    """à¸”à¸¶à¸‡à¸›à¸£à¸°à¸§à¸±à¸•à¸´à¸à¸²à¸£à¹€à¸‚à¹‰à¸²à¸ˆà¸­à¸” (Admin only - à¹à¸¢à¸à¸•à¸²à¸¡à¹‚à¸‹à¸™)"""
+    """ดึงประวัติการจอดสำหรับแอดมิน โดยสามารถกรองตามโซน"""
     try:
-        history = get_parking_history(zone_name=zone_name, limit=limit)
+        history = get_parking_history(
+            zone_name=zone_name,
+            limit=limit,
+            min_anonymous_auto_age_seconds=PARKING_AUTO_LOG_SECONDS,
+        )
         return {"status": "success", "data": history}
     except Exception as e:
         logger.error("GET_ADMIN_PARKING_HISTORY_ERROR zone=%s error=%s", zone_name, str(e))
         raise HTTPException(status_code=500, detail="Failed to fetch parking history")
 
 
-# WebRTC connections
+# เก็บรายการการเชื่อมต่อ WebRTC ที่กำลังใช้งาน
 pcs = set()
 
 @app.post("/offer")
 async def webrtc_offer(data: WebRTCOffer):
-    # à¸ªà¸£à¹‰à¸²à¸‡ source à¸ªà¸³à¸«à¸£à¸±à¸š WebRTC: à¹ƒà¸Šà¹‰à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­à¹€à¸¡à¸·à¹ˆà¸­ USE_DEMO_VIDEO=true à¸«à¸£à¸·à¸­à¹ƒà¸Šà¹‰ RTSP à¸ˆà¸£à¸´à¸‡
+    if not AIORTC_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "WebRTC is unavailable on this machine because aiortc/av could not be loaded. "
+                f"Reason: {AIORTC_IMPORT_ERROR}"
+            ),
+        )
+
+    # สร้าง source สำหรับ WebRTC: ใช้ไฟล์เมื่อเป็นโหมด demo หรือใช้ RTSP จริง
     url = get_stream_source(data.camera.ip, data.camera.username, data.camera.password)
     print(f"ðŸŽ¥ WebRTC source: {url}")
 
@@ -766,7 +935,7 @@ async def webrtc_offer(data: WebRTCOffer):
             "stimeout": "5000000"
         })
     
-    # à¸ªà¸£à¹‰à¸²à¸‡ PeerConnection
+    # สร้าง PeerConnection
     pc = RTCPeerConnection()
     pcs.add(pc)
     
@@ -777,15 +946,15 @@ async def webrtc_offer(data: WebRTCOffer):
             await pc.close()
             pcs.discard(pc)
     
-    # à¹€à¸žà¸´à¹ˆà¸¡ video track
+    # เพิ่ม video track
     if player.video:
         pc.addTrack(player.video)
     
-    # à¸•à¸±à¹‰à¸‡ remote description à¸ˆà¸²à¸ offer
+    # ตั้ง remote description จาก offer
     offer = RTCSessionDescription(sdp=data.sdp, type=data.type)
     await pc.setRemoteDescription(offer)
     
-    # à¸ªà¸£à¹‰à¸²à¸‡ answer
+    # สร้าง answer
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
     
@@ -804,7 +973,7 @@ async def websocket_live(websocket: WebSocket):
         name = type(exc).__name__
         return name in {"WebSocketDisconnect", "ClientDisconnected"}
     
-    # à¸£à¸±à¸š camera data à¸ˆà¸²à¸ client
+    # รับข้อมูลกล้องจาก client
     try:
         data = await websocket.receive_json()
         camera_id = int(data['camera_id'])
@@ -823,17 +992,17 @@ async def websocket_live(websocket: WebSocket):
         await websocket.close()
         return
     
-    # à¸ªà¸£à¹‰à¸²à¸‡ source: à¸–à¹‰à¸² USE_DEMO_VIDEO=true à¸ˆà¸°à¹€à¸›à¸´à¸”à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­à¹à¸—à¸™ RTSP
+    # สร้างแหล่งภาพ: ถ้าเปิด demo mode จะใช้ไฟล์แทน RTSP
     url = get_stream_source(ip=ip, username=username, password=password)
     if USE_DEMO_VIDEO:
         print(f"ðŸŽ¥ Starting DEMO video for camera_id={camera_id}: {url}")
     else:
         print(f"ðŸŽ¥ Starting live stream for camera_id={camera_id}, ip={ip}")
 
-    # à¹€à¸›à¸´à¸” camera à¸«à¸£à¸·à¸­à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­
+    # เปิดกล้องหรือไฟล์วิดีโอ
     cap = open_video_capture(url)
 
-    # à¹€à¸Šà¹‡à¸„à¸§à¹ˆà¸²à¹€à¸›à¸´à¸” RTSP à¹„à¸”à¹‰à¸ªà¸³à¹€à¸£à¹‡à¸ˆà¸à¹ˆà¸­à¸™ (à¸›à¹‰à¸­à¸‡à¸à¸±à¸™à¹€à¸Šà¸·à¹ˆà¸­à¸¡à¹„à¸¡à¹ˆà¹„à¸”à¹‰à¹à¸•à¹ˆà¹€à¸‚à¹‰à¸²à¸ªà¸¹à¸•à¸£ loop)
+    # ตรวจสอบว่าเปิดสตรีมได้ก่อนเข้า loop หลัก
     if not cap.isOpened():
         print(f"âŒ Cannot open video source: {url}")
         await websocket.send_text('error: cannot open video source')
@@ -846,7 +1015,7 @@ async def websocket_live(websocket: WebSocket):
     frame_queue = asyncio.Queue(maxsize=3)
     stop_event = asyncio.Event()
 
-    # worker 1: capture camera frames into queue (drop oldest if backlog)
+    # ตัวทำงานที่ 1: อ่านเฟรมจากกล้องเข้า queue (ถ้าค้างให้ทิ้งเฟรมเก่าสุด)
     async def capture_worker():
         while not stop_event.is_set():
             success, frame = await asyncio.get_running_loop().run_in_executor(None, cap.read)
@@ -860,14 +1029,14 @@ async def websocket_live(websocket: WebSocket):
 
             if frame_queue.full():
                 try:
-                    _ = frame_queue.get_nowait()  # drop oldest
+                    _ = frame_queue.get_nowait()  # ทิ้งเฟรมเก่าสุด
                 except asyncio.QueueEmpty:
                     pass
 
             await frame_queue.put(frame)
-            await asyncio.sleep(0)  # yield event loop
+            await asyncio.sleep(0)  # เปิดโอกาสให้ event loop ทำงานอื่น
 
-    # worker 2: inference+encode+send
+    # ตัวทำงานที่ 2: ทำอนุมาน + เข้ารหัสภาพ + ส่งกลับไปยัง client
     async def processing_worker():
         nonlocal frame_count
         avg_proc = 0.08
@@ -884,7 +1053,7 @@ async def websocket_live(websocket: WebSocket):
             t0 = time.time()
             now = time.time()
             force_slot_refresh = not cached_slots or (now - last_slot_refresh) >= SLOTS_REFRESH_INTERVAL
-            annotated_frame, cached_slots, stats = annotate_parking_frame(frame, cached_slots, force_slot_refresh)
+            annotated_frame, cached_slots, stats = annotate_parking_frame(frame, cached_slots, force_slot_refresh, camera_id)
             if force_slot_refresh:
                 last_slot_refresh = now
             auto_log_slots, exit_events = update_parking_state(camera_id, stats.get("occupied_slots", []))
@@ -918,7 +1087,7 @@ async def websocket_live(websocket: WebSocket):
                 stop_event.set()
                 return
             except RuntimeError as e:
-                # Raised when client disconnects and websocket is already closed.
+                # เกิดเมื่อ client ตัดการเชื่อมต่อและ websocket ถูกปิดไปแล้ว
                 print(f"â„¹ï¸ WebSocket send stopped: {e}")
                 stop_event.set()
                 return
@@ -983,7 +1152,7 @@ async def websocket_live(websocket: WebSocket):
 
 @app.websocket("/ws/preview_camera")
 async def websocket_preview_camera(websocket: WebSocket):
-    """Low-latency preview stream for add-camera page (no AI inference)."""
+    """สตรีมภาพพรีวิวหน่วงต่ำสำหรับหน้าเพิ่มกล้อง (ไม่รัน AI)"""
     await websocket.accept()
     cap = None
 
@@ -1054,7 +1223,7 @@ async def health():
         release_connection(conn)
 
 
-# --- Camera Manager ---
+# --- ตัวจัดการกล้องสำหรับจุดเรียกดึงภาพเดี่ยว ---
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 class CameraStream:
@@ -1076,7 +1245,7 @@ class CameraStream:
                         self.frame = frame.copy()
                         self.status = True
                 else:
-                    # à¸–à¹‰à¸²à¹€à¸›à¹‡à¸™à¹„à¸Ÿà¸¥à¹Œà¸§à¸´à¸”à¸µà¹‚à¸­à¹à¸¥à¸°à¸ˆà¸šà¸„à¸¥à¸´à¸› à¹ƒà¸«à¹‰ loop à¸à¸¥à¸±à¸šà¹„à¸›à¹€à¸Ÿà¸£à¸¡à¹à¸£à¸
+                    # ถ้าเป็นไฟล์วิดีโอและเล่นจบ ให้ย้อนกลับเฟรมแรกเพื่อวนลูป
                     if self.current_url and rewind_if_demo_video(self.cap, self.current_url):
                         self.status = False
                         time.sleep(0.03)
@@ -1099,14 +1268,33 @@ class CameraStream:
 
 cam_manager = CameraStream()
 
-# --- API Endpoints ---
+# --- จุดเรียก API หลัก ---
 
 @app.post("/add_camera")
 async def add_camera(data: CameraRegister):
-    success = add_camera_to_db(data.camera_name, data.ip, data.username, data.password, data.zone_name)
-    if success:
-        return {"status": "success", "message": "Camera added"}
+    camera_id = add_camera_to_db(data.camera_name, data.ip, data.username, data.password, data.zone_name)
+    if camera_id:
+        # กล้องใหม่เริ่มด้วย ROI ว่าง เพื่อไม่ให้สืบทอด ROI กลางเดิม
+        save_camera_rois(camera_id, [960, 540], [])
+        return {"status": "success", "message": "Camera added", "camera_id": camera_id}
     raise HTTPException(status_code=500, detail="Failed to add camera")
+
+
+@app.post("/delete_camera")
+async def delete_camera(data: CameraDeleteRequest):
+    auth = authenticate_user(data.username, data.password)
+    if auth["status"] != "authenticated":
+        raise HTTPException(status_code=401, detail="Invalid admin credentials")
+
+    role = get_user_role(data.username)
+    if role != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can delete camera")
+
+    deleted = delete_camera_from_db(data.camera_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Camera not found or cannot be deleted")
+
+    return {"status": "success", "message": "Camera deleted", "camera_id": data.camera_id}
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -1121,10 +1309,10 @@ async def global_exception_handler(request: Request, exc: Exception):
         },
     )
 
-# --- Health & Debug Routes ---
+# --- เส้นทางตรวจสอบสถานะและดีบัก ---
 @app.get("/ping")
 async def ping():
-    """à¸—à¸”à¸ªà¸­à¸šà¸§à¹ˆà¸² backend + ngrok à¸•à¸­à¸šà¹„à¸”à¹‰à¸›à¸à¸•à¸´"""
+    """ทดสอบว่า backend ตอบสนองได้ตามปกติ"""
     return {"status": "ok", "time": time.time()}
 
 
@@ -1138,7 +1326,18 @@ async def roi_marker_page():
 
 
 @app.get("/roi_marker/data")
-async def roi_marker_data():
+async def roi_marker_data(camera_id: int | None = None):
+    if camera_id is not None:
+        data = get_camera_rois(camera_id)
+        if data:
+            return data
+        return {
+            "camera_id": camera_id,
+            "image_size": [960, 540],
+            "rois": [],
+            "scope": "camera",
+        }
+
     path = resolve_backend_path(MANUAL_ROI_PATH)
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return {"image_size": [960, 540], "rois": []}
@@ -1209,6 +1408,16 @@ async def roi_marker_save(data: RoiMarkerSave):
         "rois": cleaned_rois,
     }
 
+    if data.camera_id is not None:
+        if not save_camera_rois(data.camera_id, output["image_size"], output["rois"]):
+            raise HTTPException(status_code=500, detail="Failed to save camera-specific ROI")
+        return {
+            "status": "success",
+            "slots": len(cleaned_rois),
+            "camera_id": data.camera_id,
+            "scope": "camera",
+        }
+
     path = writable_backend_path(MANUAL_ROI_PATH)
     directory = os.path.dirname(path)
     if directory:
@@ -1222,26 +1431,26 @@ async def roi_marker_save(data: RoiMarkerSave):
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Failed to save ROI file: {exc}")
 
-    return {"status": "success", "slots": len(cleaned_rois), "path": path}
+    return {"status": "success", "slots": len(cleaned_rois), "path": path, "scope": "global"}
 
 
 @app.options("/get_cameras")
 async def get_cameras_options():
-    """CORS preflight - à¹ƒà¸«à¹‰ CORSMiddleware à¸ˆà¸±à¸”à¸à¸²à¸£"""
+    """ตอบ CORS preflight สำหรับจุดเรียกรายการกล้อง"""
     print("ðŸ“‹ OPTIONS /get_cameras preflight")
     return {}
 
 
 @app.get("/get_cameras")
 async def get_cameras():
-    """à¸”à¸¶à¸‡à¸£à¸²à¸¢à¸à¸²à¸£à¸à¸¥à¹‰à¸­à¸‡à¸—à¸±à¹‰à¸‡à¸«à¸¡à¸” - à¹ƒà¸«à¹‰ CORSMiddleware à¸ˆà¸±à¸”à¸à¸²à¸£ header"""
+    """ดึงรายการกล้องทั้งหมด"""
     print("âž¡ï¸ /get_cameras called")
     request_time = time.time()
     try:
         cameras = get_all_cameras()
         elapsed = time.time() - request_time
         print(f"âœ… /get_cameras returned {len(cameras)} cameras in {elapsed:.3f}s")
-        # à¸ªà¹ˆà¸‡ data à¸à¸¥à¸±à¸šà¸­à¸¢à¹ˆà¸²à¸‡à¹€à¸£à¸µà¸¢à¸šà¸£à¹‰à¸­à¸¢ à¹„à¸¡à¹ˆà¸•à¹‰à¸­à¸‡ custom headers
+        # ส่งข้อมูลกลับได้ทันที ไม่ต้องใส่ header เพิ่มเอง
         return cameras
     except Exception as e:
         elapsed = time.time() - request_time
@@ -1265,10 +1474,10 @@ async def get_frame(data: CameraByIdRequest):
         with cam_manager.lock:
             input_frame = cam_manager.frame.copy()
 
-        # à¸›à¸£à¸°à¸¡à¸§à¸¥à¸œà¸¥ AI
-        annotated_frame, _, stats = annotate_parking_frame(input_frame, force_slot_refresh=True)
+        # ประมวลผล AI และวาดผลลงภาพ
+        annotated_frame, _, stats = annotate_parking_frame(input_frame, force_slot_refresh=True, camera_id=data.camera_id)
 
-        # à¸¢à¹ˆà¸­à¸‚à¸™à¸²à¸”à¹à¸¥à¸°à¹€à¸‚à¹‰à¸²à¸£à¸«à¸±à¸ª
+        # เข้ารหัสภาพเป็น JPEG + Base64 สำหรับส่งกลับ
         _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         jpg_as_text = base64.b64encode(buffer).decode('utf-8')
         
@@ -1283,7 +1492,7 @@ async def get_frame(data: CameraByIdRequest):
 
 @app.post("/preview_camera")
 async def preview_camera(data: CameraByIdRequest):
-    """à¸Ÿà¸±à¸‡à¸à¹Œà¸Šà¸±à¸™à¸ªà¸³à¸«à¸£à¸±à¸šà¸à¸” Preview à¸”à¸¹à¸ à¸²à¸žà¸à¹ˆà¸­à¸™à¸šà¸±à¸™à¸—à¸¶à¸"""
+    """ดึงภาพพรีวิวจากกล้องตาม camera_id เพื่อทดสอบก่อนบันทึก"""
     cam = get_camera_credentials(data.camera_id)
     if not cam:
         raise HTTPException(status_code=404, detail="Camera not found")
@@ -1294,13 +1503,13 @@ async def preview_camera(data: CameraByIdRequest):
         password=cam['password'],
     )
 
-    # à¸—à¸”à¸ªà¸­à¸šà¸”à¸¶à¸‡à¸ à¸²à¸žà¸”à¹‰à¸§à¸¢ OpenCV
+    # ทดลองอ่านภาพจากกล้องด้วย OpenCV
     cap = open_video_capture(target_url)
     success, frame = cap.read()
-    cap.release() # à¹€à¸›à¸´à¸”à¹à¸¥à¹‰à¸§à¸£à¸µà¸šà¸›à¸´à¸”à¸—à¸±à¸™à¸—à¸µà¹€à¸žà¸·à¹ˆà¸­à¹„à¸¡à¹ˆà¹ƒà¸«à¹‰à¸„à¹‰à¸²à¸‡
+    cap.release() # ปล่อยกล้องทันทีหลังอ่านเฟรม เพื่อไม่ให้ค้างการเชื่อมต่อ
 
     if success:
-        # à¸¢à¹ˆà¸­à¸‚à¸™à¸²à¸”à¹à¸¥à¸°à¹à¸›à¸¥à¸‡à¹€à¸›à¹‡à¸™ Base64 à¸ªà¹ˆà¸‡à¸à¸¥à¸±à¸šà¹„à¸›à¹ƒà¸«à¹‰à¸”à¸¹
+        # ย่อภาพและแปลงเป็น Base64 เพื่อส่งกลับให้หน้าเว็บแสดงผล
         resized = cv2.resize(frame, (640, 360))
         _, buffer = cv2.imencode('.jpg', resized, [cv2.IMWRITE_JPEG_QUALITY, 80])
         jpg_as_text = base64.b64encode(buffer).decode('utf-8')
