@@ -124,7 +124,7 @@ def build_rtsp_url(username: str, password: str, ip: str) -> str:
 
 
 def _resolve_demo_video_source(ip: str = "") -> str:
-    """ค้นหา path วิดีโอตัวอย่างรายกล้องเมื่อ USE_DEMO_VIDEO=true
+    """ค้นหา path วิดีโอตัวอย่างจากค่ากล้องหรือค่า default ของระบบ
 
     รองรับรูปแบบ ip ในแถวกล้องดังนี้:
     - video:videos/file.mp4
@@ -148,6 +148,10 @@ def _resolve_demo_video_source(ip: str = "") -> str:
 
 def get_stream_source(ip: str = "", username: str = "", password: str = "") -> str:
     """คืนค่า URL หรือ path ของแหล่งภาพที่จะให้ OpenCV/MediaPlayer เปิดใช้งาน"""
+    value = (ip or "").strip().lower()
+    if value.startswith(("video:", "file:")) or value.endswith((".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v")):
+        return _resolve_demo_video_source(ip=ip)
+
     if USE_DEMO_VIDEO:
         return _resolve_demo_video_source(ip=ip)
     return build_rtsp_url(username=username, password=password, ip=ip)
