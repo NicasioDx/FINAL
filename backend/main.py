@@ -125,6 +125,7 @@ model = None
 device = "cpu"
 parking_state_lock = threading.Lock()
 parking_state: dict[int, dict[int, dict[str, object]]] = {}
+last_parking_occupancy: dict[int, set[int]] = {}
 
 
 def resolve_backend_path(path: str, fallbacks: Optional[list[str]] = None) -> str:
@@ -628,13 +629,15 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
     )
 
 
-def assign_occupied_slots(slots: list[Slot], vehicles: list[tuple[int, int, int, int]]) -> set[int]:
+def assign_occupied_slots(slots: list[Slot], vehicles: list[tuple[int, int, int, int]], previous_occupied_slots: Optional[set[int]] = None) -> set[int]:
     """จับคู่รถแต่ละคันได้สูงสุดหนึ่งช่อง เพื่อกันรถคันเดียวลากแดงหลายช่อง"""
     candidates: list[tuple[float, int, int]] = []
     for slot_idx, slot in enumerate(slots):
         for vehicle_idx, vehicle in enumerate(vehicles):
             score = slot_vehicle_match_score(slot, vehicle)
             if score is not None:
+                if previous_occupied_slots and slot_idx in previous_occupied_slots:
+                    score += 0.05
                 candidates.append((score, slot_idx, vehicle_idx))
 
     candidates.sort(reverse=True, key=lambda item: item[0])
@@ -650,9 +653,12 @@ def assign_occupied_slots(slots: list[Slot], vehicles: list[tuple[int, int, int,
     return used_slots
 
 
-def draw_parking_overlay(frame, slots: list[Slot], vehicles: list[tuple[int, int, int, int]]):
+def draw_parking_overlay(frame, slots: list[Slot], vehicles: list[tuple[int, int, int, int]], camera_id: Optional[int] = None):
     annotated = frame.copy()
-    occupied_slot_indexes = assign_occupied_slots(slots, vehicles)
+    previous_occupied_slots = last_parking_occupancy.get(camera_id, set()) if camera_id is not None else set()
+    occupied_slot_indexes = assign_occupied_slots(slots, vehicles, previous_occupied_slots)
+    if camera_id is not None:
+        last_parking_occupancy[camera_id] = set(occupied_slot_indexes)
     occupied_slots = sorted(index + 1 for index in occupied_slot_indexes)
     occupied_count = len(occupied_slots)
 
@@ -712,7 +718,7 @@ def annotate_parking_frame(
                 slots = load_manual_slots(*STREAM_SIZE)
 
     vehicles = detect_vehicles(resized_frame, half_precision)
-    annotated_frame, stats = draw_parking_overlay(resized_frame, slots, vehicles)
+    annotated_frame, stats = draw_parking_overlay(resized_frame, slots, vehicles, camera_id)
     return annotated_frame, slots, stats
 
 
