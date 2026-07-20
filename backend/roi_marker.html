@@ -301,6 +301,28 @@
       }
     }
 
+    function drawLabel(point, label, color) {
+      if (!point) return;
+      ctx.font = '18px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = '#ffffff';
+      ctx.strokeText(label, point[0], point[1]);
+      ctx.fillStyle = color;
+      ctx.fillText(label, point[0], point[1]);
+    }
+
+    function polygonCentroid(points) {
+      if (!points.length) return null;
+      const sum = points.reduce((acc, point) => {
+        acc[0] += point[0];
+        acc[1] += point[1];
+        return acc;
+      }, [0, 0]);
+      return [sum[0] / points.length, sum[1] / points.length];
+    }
+
     function drawPolygon(points, color, width) {
       if (!points.length) return;
       ctx.beginPath();
@@ -324,7 +346,9 @@
 
       rois.forEach((roi, index) => {
         drawPolygon(roi.points, '#00c83c', 3);
-        roi.points.forEach((point, pointIndex) => drawPoint(point, '#00c83c', pointIndex === 0 ? String(index + 1) : ''));
+        roi.points.forEach(point => drawPoint(point, '#00c83c'));
+        const center = polygonCentroid(roi.points);
+        if (center) drawLabel(center, String(index + 1), '#0c3d08');
       });
 
       drawPolygon(current, '#2558d8', 3);
