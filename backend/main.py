@@ -455,6 +455,16 @@ def polygon_area(points: list[tuple[int, int]]) -> float:
     return float(cv2.contourArea(np.array(points, dtype=np.float32)))
 
 
+def polygon_centroid(points: list[tuple[int, int]]) -> tuple[float, float]:
+    contour = np.array(points, dtype=np.float32)
+    moments = cv2.moments(contour)
+    if moments["m00"]:
+        return (moments["m10"] / moments["m00"], moments["m01"] / moments["m00"])
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return (float(sum(xs) / max(1, len(xs))), float(sum(ys) / max(1, len(ys))))
+
+
 def vehicle_center(vehicle: tuple[int, int, int, int]) -> tuple[float, float]:
     return ((vehicle[0] + vehicle[2]) / 2.0, (vehicle[1] + vehicle[3]) / 2.0)
 
@@ -471,6 +481,7 @@ def vehicle_footprint_box(vehicle: tuple[int, int, int, int], ratio: float) -> t
 def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> Optional[float]:
     polygon = slot_polygon(slot)
     slot_area = max(1.0, polygon_area(polygon))
+    slot_cx, slot_cy = polygon_centroid(polygon)
     slot_center_y = float(np.mean([point[1] for point in polygon]))
     slot_y_ratio = slot_center_y / max(1.0, float(STREAM_HEIGHT))
     is_far_slot = slot_y_ratio <= FAR_ZONE_Y_RATIO
@@ -510,6 +521,16 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
     contour = np.array(polygon, dtype=np.int32)
     center_distance = cv2.pointPolygonTest(contour, (center_x, center_y), True)
     bottom_center_distance = cv2.pointPolygonTest(contour, (bottom_center_x, bottom_center_y), True)
+    slot_center_in_vehicle = cv2.pointPolygonTest(
+        np.array(vehicle_polygon, dtype=np.int32),
+        (slot_cx, slot_cy),
+        False,
+    ) >= 0
+    slot_center_in_footprint = cv2.pointPolygonTest(
+        np.array(footprint_polygon, dtype=np.int32),
+        (slot_cx, slot_cy),
+        False,
+    ) >= 0
     center_in_slot = center_distance >= 0
     center_near_edge = center_distance >= -CENTER_EDGE_TOLERANCE_PX
     bottom_center_in_slot = bottom_center_distance >= 0
@@ -522,6 +543,8 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
         or (center_near_edge and slot_overlap_ratio >= edge_min_slot_overlap)
         or (footprint_slot_overlap_ratio >= footprint_min_slot_overlap)
         or (footprint_vehicle_overlap_ratio >= footprint_min_vehicle_overlap)
+        or (slot_center_in_vehicle and footprint_slot_overlap_ratio >= 0.05)
+        or (slot_center_in_footprint and footprint_slot_overlap_ratio >= 0.03)
         or (bottom_center_in_slot and footprint_slot_overlap_ratio >= 0.06)
         or (bottom_center_near_edge and footprint_slot_overlap_ratio >= bottom_center_overlap)
     )
@@ -534,6 +557,8 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
         + (vehicle_overlap_ratio * 0.20)
         + (footprint_slot_overlap_ratio * 0.35)
         + (footprint_vehicle_overlap_ratio * 0.10)
+        + (0.20 if slot_center_in_footprint else 0.0)
+        + (0.12 if slot_center_in_vehicle else 0.0)
         + (0.18 if center_in_slot else 0.0)
         + (0.22 if bottom_center_in_slot else 0.0)
     )
