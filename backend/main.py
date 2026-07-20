@@ -81,6 +81,9 @@ EDGE_MIN_SLOT_OVERLAP = float(env_value("EDGE_MIN_SLOT_OVERLAP", "0.10"))
 VEHICLE_FOOTPRINT_RATIO = float(env_value("VEHICLE_FOOTPRINT_RATIO", "0.38"))
 FOOTPRINT_MIN_SLOT_OVERLAP = float(env_value("FOOTPRINT_MIN_SLOT_OVERLAP", "0.14"))
 FOOTPRINT_MIN_VEHICLE_OVERLAP = float(env_value("FOOTPRINT_MIN_VEHICLE_OVERLAP", "0.24"))
+VEHICLE_BASE_BAND_RATIO = float(env_value("VEHICLE_BASE_BAND_RATIO", "0.18"))
+BASE_BAND_MIN_SLOT_OVERLAP = float(env_value("BASE_BAND_MIN_SLOT_OVERLAP", "0.05"))
+BASE_BAND_MIN_VEHICLE_OVERLAP = float(env_value("BASE_BAND_MIN_VEHICLE_OVERLAP", "0.14"))
 FAR_ZONE_Y_RATIO = float(env_value("FAR_ZONE_Y_RATIO", "0.46"))
 FAR_THRESHOLD_SCALE = float(env_value("FAR_THRESHOLD_SCALE", "0.72"))
 PARKING_AUTO_LOG_SECONDS = float(env_value("PARKING_AUTO_LOG_SECONDS", "10"))
@@ -101,6 +104,9 @@ PREVIEW_JPEG_QUALITY = max(40, min(95, PREVIEW_JPEG_QUALITY))
 VEHICLE_FOOTPRINT_RATIO = max(0.20, min(0.70, VEHICLE_FOOTPRINT_RATIO))
 FOOTPRINT_MIN_SLOT_OVERLAP = max(0.02, min(0.60, FOOTPRINT_MIN_SLOT_OVERLAP))
 FOOTPRINT_MIN_VEHICLE_OVERLAP = max(0.05, min(0.80, FOOTPRINT_MIN_VEHICLE_OVERLAP))
+VEHICLE_BASE_BAND_RATIO = max(0.10, min(0.35, VEHICLE_BASE_BAND_RATIO))
+BASE_BAND_MIN_SLOT_OVERLAP = max(0.01, min(0.50, BASE_BAND_MIN_SLOT_OVERLAP))
+BASE_BAND_MIN_VEHICLE_OVERLAP = max(0.05, min(0.60, BASE_BAND_MIN_VEHICLE_OVERLAP))
 FAR_ZONE_Y_RATIO = max(0.10, min(0.90, FAR_ZONE_Y_RATIO))
 FAR_THRESHOLD_SCALE = max(0.45, min(1.00, FAR_THRESHOLD_SCALE))
 STREAM_SIZE = (STREAM_WIDTH, STREAM_HEIGHT)
@@ -478,6 +484,15 @@ def vehicle_footprint_box(vehicle: tuple[int, int, int, int], ratio: float) -> t
     return (x1, fy1, x2, y2)
 
 
+def vehicle_base_band_box(vehicle: tuple[int, int, int, int], ratio: float) -> tuple[int, int, int, int]:
+    """ช่วงล่างสุดของรถแบบแคบกว่าฟุตปริ้นท์ เหมาะกับมุมกล้องเฉียงและรถสูง"""
+    x1, y1, x2, y2 = vehicle
+    h = max(1, y2 - y1)
+    band_h = max(1, int(round(h * ratio)))
+    by1 = max(y1, y2 - band_h)
+    return (x1, by1, x2, y2)
+
+
 def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> Optional[float]:
     polygon = slot_polygon(slot)
     slot_area = max(1.0, polygon_area(polygon))
@@ -499,22 +514,33 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
     overlap_area = convex_intersection_area(polygon, vehicle_polygon)
 
     footprint = vehicle_footprint_box(vehicle, VEHICLE_FOOTPRINT_RATIO)
+    base_band = vehicle_base_band_box(vehicle, VEHICLE_BASE_BAND_RATIO)
     footprint_area = max(1, (footprint[2] - footprint[0]) * (footprint[3] - footprint[1]))
+    base_band_area = max(1, (base_band[2] - base_band[0]) * (base_band[3] - base_band[1]))
     footprint_polygon = [
         (footprint[0], footprint[1]),
         (footprint[2], footprint[1]),
         (footprint[2], footprint[3]),
         (footprint[0], footprint[3]),
     ]
+    base_band_polygon = [
+        (base_band[0], base_band[1]),
+        (base_band[2], base_band[1]),
+        (base_band[2], base_band[3]),
+        (base_band[0], base_band[3]),
+    ]
     footprint_overlap_area = convex_intersection_area(polygon, footprint_polygon)
+    base_band_overlap_area = convex_intersection_area(polygon, base_band_polygon)
 
-    if overlap_area <= 0 and footprint_overlap_area <= 0:
+    if overlap_area <= 0 and footprint_overlap_area <= 0 and base_band_overlap_area <= 0:
         return None
 
     vehicle_overlap_ratio = overlap_area / vehicle_area
     slot_overlap_ratio = overlap_area / slot_area
     footprint_vehicle_overlap_ratio = footprint_overlap_area / footprint_area
     footprint_slot_overlap_ratio = footprint_overlap_area / slot_area
+    base_band_vehicle_overlap_ratio = base_band_overlap_area / base_band_area
+    base_band_slot_overlap_ratio = base_band_overlap_area / slot_area
     center_x, center_y = vehicle_center(vehicle)
     bottom_center_x = (vehicle[0] + vehicle[2]) / 2.0
     bottom_center_y = float(vehicle[3])
@@ -531,6 +557,11 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
         (slot_cx, slot_cy),
         False,
     ) >= 0
+    slot_center_in_base_band = cv2.pointPolygonTest(
+        np.array(base_band_polygon, dtype=np.int32),
+        (slot_cx, slot_cy),
+        False,
+    ) >= 0
     center_in_slot = center_distance >= 0
     center_near_edge = center_distance >= -CENTER_EDGE_TOLERANCE_PX
     bottom_center_in_slot = bottom_center_distance >= 0
@@ -543,8 +574,11 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
         or (center_near_edge and slot_overlap_ratio >= edge_min_slot_overlap)
         or (footprint_slot_overlap_ratio >= footprint_min_slot_overlap)
         or (footprint_vehicle_overlap_ratio >= footprint_min_vehicle_overlap)
+        or (base_band_slot_overlap_ratio >= BASE_BAND_MIN_SLOT_OVERLAP)
+        or (base_band_vehicle_overlap_ratio >= BASE_BAND_MIN_VEHICLE_OVERLAP)
         or (slot_center_in_vehicle and footprint_slot_overlap_ratio >= 0.05)
         or (slot_center_in_footprint and footprint_slot_overlap_ratio >= 0.03)
+        or (slot_center_in_base_band and base_band_slot_overlap_ratio >= 0.02)
         or (bottom_center_in_slot and footprint_slot_overlap_ratio >= 0.06)
         or (bottom_center_near_edge and footprint_slot_overlap_ratio >= bottom_center_overlap)
     )
@@ -557,7 +591,10 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
         + (vehicle_overlap_ratio * 0.20)
         + (footprint_slot_overlap_ratio * 0.35)
         + (footprint_vehicle_overlap_ratio * 0.10)
+        + (base_band_slot_overlap_ratio * 0.25)
+        + (base_band_vehicle_overlap_ratio * 0.10)
         + (0.20 if slot_center_in_footprint else 0.0)
+        + (0.20 if slot_center_in_base_band else 0.0)
         + (0.12 if slot_center_in_vehicle else 0.0)
         + (0.18 if center_in_slot else 0.0)
         + (0.22 if bottom_center_in_slot else 0.0)
