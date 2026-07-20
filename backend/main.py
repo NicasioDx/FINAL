@@ -475,6 +475,28 @@ def polygon_centroid(points: list[tuple[int, int]]) -> tuple[float, float]:
     return (float(sum(xs) / max(1, len(xs))), float(sum(ys) / max(1, len(ys))))
 
 
+def slot_center(slot: Slot) -> tuple[float, float]:
+    polygon = slot_polygon(slot)
+    return polygon_centroid(polygon)
+
+
+def slot_span(slot: Slot) -> tuple[float, float]:
+    polygon = slot_polygon(slot)
+    xs = [point[0] for point in polygon]
+    ys = [point[1] for point in polygon]
+    return float(max(xs) - min(xs)), float(max(ys) - min(ys))
+
+
+def slots_are_neighbors(slot_a: Slot, slot_b: Slot) -> bool:
+    ax, ay = slot_center(slot_a)
+    bx, by = slot_center(slot_b)
+    aw, ah = slot_span(slot_a)
+    bw, bh = slot_span(slot_b)
+    same_row = abs(ay - by) <= max(18.0, min(ah, bh) * 0.45)
+    close_x = abs(ax - bx) <= max(aw, bw) * 1.35
+    return same_row and close_x
+
+
 def vehicle_center(vehicle: tuple[int, int, int, int]) -> tuple[float, float]:
     return ((vehicle[0] + vehicle[2]) / 2.0, (vehicle[1] + vehicle[3]) / 2.0)
 
@@ -622,12 +644,15 @@ def assign_occupied_slots(slots: list[Slot], vehicles: list[tuple[int, int, int,
         scored_slots.sort(reverse=True, key=lambda item: item[0])
         best_score = scored_slots[0][0]
         slot_limit = 2 if best_score >= MULTI_SLOT_MIN_SCORE else 1
+        best_slot_idx = scored_slots[0][1]
 
         picked = 0
         for score, slot_idx in scored_slots:
             if score < MULTI_SLOT_MIN_SCORE:
                 continue
             if score < best_score * MULTI_SLOT_SCORE_RATIO:
+                continue
+            if picked > 0 and not slots_are_neighbors(slots[best_slot_idx], slots[slot_idx]):
                 continue
             occupied_slots.add(slot_idx)
             picked += 1
