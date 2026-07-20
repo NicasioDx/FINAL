@@ -1358,7 +1358,7 @@ async def roi_marker_data(camera_id: Optional[int] = None):
 
 @app.get("/roi_marker/frame")
 async def roi_marker_frame(camera_id: Optional[int] = None, second: float = 50.0):
-    if camera_id is not None and not USE_DEMO_VIDEO:
+    if camera_id is not None:
         cam = get_camera_credentials(camera_id)
         if not cam:
             raise HTTPException(status_code=404, detail="Camera not found")

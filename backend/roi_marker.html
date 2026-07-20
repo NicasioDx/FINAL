@@ -7,32 +7,39 @@
   <style>
     :root {
       color-scheme: light;
-      font-family: Arial, Helvetica, sans-serif;
-      --bg: #f4f6f8;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      --bg: #eef3fb;
+      --bg-soft: #f8fbff;
       --panel: #ffffff;
-      --ink: #17202a;
-      --muted: #697586;
-      --line: #d6dde6;
-      --green: #00b52d;
-      --blue: #2558d8;
-      --red: #d0342c;
+      --ink: #11203a;
+      --muted: #60708a;
+      --line: #d9e2ef;
+      --line-strong: #c7d4e8;
+      --green: #0f9d58;
+      --blue: #1f5eff;
+      --red: #dc3d3d;
+      --shadow: 0 10px 28px rgba(17, 32, 58, 0.12);
+      --shadow-soft: 0 4px 14px rgba(17, 32, 58, 0.08);
     }
 
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      background: var(--bg);
+      background: linear-gradient(180deg, var(--bg) 0%, var(--bg-soft) 100%);
       color: var(--ink);
+      min-height: 100vh;
     }
 
     header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
-      padding: 12px 16px;
-      background: var(--panel);
-      border-bottom: 1px solid var(--line);
+      gap: 14px;
+      padding: 12px 18px;
+      background: rgba(255, 255, 255, 0.9);
+      backdrop-filter: blur(6px);
+      border-bottom: 1px solid var(--line-strong);
+      box-shadow: var(--shadow-soft);
       position: sticky;
       top: 0;
       z-index: 4;
@@ -40,30 +47,68 @@
 
     h1 {
       margin: 0;
-      font-size: 18px;
+      font-size: 20px;
       font-weight: 700;
+      letter-spacing: 0.2px;
     }
 
     .toolbar {
       display: flex;
       flex-wrap: wrap;
-      gap: 8px;
+      justify-content: flex-end;
+      gap: 10px;
       align-items: center;
+    }
+
+    .field {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0 10px;
+      height: 38px;
+      background: #fff;
+      font-size: 13px;
+      color: var(--muted);
+      font-weight: 600;
     }
 
     button, input {
       border: 1px solid var(--line);
-      border-radius: 6px;
+      border-radius: 10px;
       background: #fff;
       color: var(--ink);
-      height: 36px;
-      padding: 0 10px;
+      height: 38px;
+      padding: 0 12px;
       font-size: 14px;
+      transition: all 0.18s ease;
+    }
+
+    input {
+      width: 94px;
+      border-color: var(--line-strong);
+    }
+
+    input:focus {
+      outline: none;
+      border-color: var(--blue);
+      box-shadow: 0 0 0 3px rgba(31, 94, 255, 0.16);
     }
 
     button {
       cursor: pointer;
       font-weight: 700;
+      border-color: var(--line-strong);
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: var(--shadow-soft);
+    }
+
+    button:active {
+      transform: translateY(0);
     }
 
     button.primary {
@@ -79,22 +124,27 @@
     }
 
     main {
+      max-width: 1600px;
+      margin: 0 auto;
       display: grid;
       grid-template-columns: minmax(0, 1fr) 280px;
-      gap: 14px;
-      padding: 14px;
+      gap: 16px;
+      padding: 18px;
     }
 
     .stage {
       background: #0c1117;
-      border: 1px solid var(--line);
+      border: 1px solid #1f2c3f;
+      border-radius: 14px;
       overflow: auto;
       min-height: 300px;
+      box-shadow: var(--shadow);
     }
 
     canvas {
       display: block;
-      width: min(100%, 960px);
+      width: 100%;
+      max-width: 1200px;
       height: auto;
       cursor: crosshair;
     }
@@ -102,15 +152,21 @@
     aside {
       background: var(--panel);
       border: 1px solid var(--line);
-      padding: 12px;
+      border-radius: 14px;
+      box-shadow: var(--shadow-soft);
+      padding: 14px;
       min-height: 300px;
     }
 
     .status {
-      color: var(--muted);
+      color: #2a3b57;
+      background: #f2f6fd;
+      border: 1px solid var(--line);
+      border-radius: 10px;
       font-size: 13px;
       line-height: 1.4;
-      margin: 0 0 10px;
+      margin: 0 0 12px;
+      padding: 10px;
     }
 
     .slot-list {
@@ -122,21 +178,26 @@
 
     .slot-item {
       border: 1px solid var(--line);
-      border-radius: 6px;
+      border-radius: 8px;
       padding: 8px;
       font-size: 13px;
       background: #fff;
+      line-height: 1.35;
+      color: #22324d;
     }
 
     .slot-item.active {
       border-color: var(--green);
       box-shadow: inset 3px 0 0 var(--green);
+      background: #f4fff7;
     }
 
     @media (max-width: 900px) {
       header { align-items: flex-start; flex-direction: column; }
+      .toolbar { justify-content: flex-start; }
       main { grid-template-columns: 1fr; }
       aside { min-height: 0; }
+      canvas { max-width: none; }
     }
   </style>
 </head>
@@ -144,7 +205,7 @@
   <header>
     <h1 id="pageTitle">Parking ROI Marker</h1>
     <div class="toolbar">
-      <label>Frame second <input id="secondInput" type="number" value="50" min="0" step="1"></label>
+      <label class="field">Frame second <input id="secondInput" type="number" value="50" min="0" step="1"></label>
       <button id="reloadBtn">Reload frame</button>
       <button id="undoPointBtn">Undo point</button>
       <button id="undoSlotBtn">Undo slot</button>
@@ -284,7 +345,14 @@
 
     function loadFrame() {
       const second = Number(secondInput.value || 0);
-      image.src = `/roi_marker/frame?second=${encodeURIComponent(second)}&t=${Date.now()}`;
+      const query = new URLSearchParams({
+        second: String(second),
+        t: String(Date.now()),
+      });
+      if (cameraId) {
+        query.set('camera_id', cameraId);
+      }
+      image.src = `/roi_marker/frame?${query.toString()}`;
     }
 
     async function save() {
@@ -306,6 +374,10 @@
 
     canvas.addEventListener('click', event => addPoint(canvasPoint(event)));
     image.addEventListener('load', redraw);
+    image.addEventListener('error', () => {
+      setStatus('Load frame failed: ตรวจสอบ source ของกล้องหรือไฟล์วิดีโอ');
+      redraw();
+    });
 
     document.getElementById('reloadBtn').addEventListener('click', loadFrame);
     document.getElementById('undoPointBtn').addEventListener('click', () => {
