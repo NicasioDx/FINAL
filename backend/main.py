@@ -89,6 +89,7 @@ FAR_THRESHOLD_SCALE = float(env_value("FAR_THRESHOLD_SCALE", "0.72"))
 MULTI_SLOT_MIN_SCORE = float(env_value("MULTI_SLOT_MIN_SCORE", "0.58"))
 MULTI_SLOT_SCORE_RATIO = float(env_value("MULTI_SLOT_SCORE_RATIO", "0.82"))
 PARKING_AUTO_LOG_SECONDS = float(env_value("PARKING_AUTO_LOG_SECONDS", "10"))
+PARKING_EXIT_GRACE_SECONDS = float(env_value("PARKING_EXIT_GRACE_SECONDS", "2.0"))
 SLOTS_REFRESH_INTERVAL = int(env_value("SLOTS_REFRESH_INTERVAL", "60"))
 STREAM_WIDTH = int(env_value("STREAM_WIDTH", "960"))
 STREAM_HEIGHT = int(env_value("STREAM_HEIGHT", "540"))
@@ -728,13 +729,16 @@ def update_parking_state(camera_id: int, occupied_slots: list[int]) -> tuple[lis
         for slot_number in list(camera_state.keys()):
             if slot_number not in occupied_set:
                 slot_state = camera_state[slot_number]
-                was_logged = bool(slot_state.get("auto_logged", False)) or bool(slot_state.get("manual_logged", False))
-                if was_logged:
-                    exit_events.append({
-                        "slot_number": slot_number,
-                        "username": slot_state.get("username"),
-                    })
-                del camera_state[slot_number]
+                last_seen = float(slot_state.get("last_seen", now))
+                if now - last_seen >= PARKING_EXIT_GRACE_SECONDS:
+                    was_logged = bool(slot_state.get("auto_logged", False)) or bool(slot_state.get("manual_logged", False))
+                    if was_logged:
+                        exit_events.append({
+                            "slot_number": slot_number,
+                            "username": slot_state.get("username"),
+                        })
+                    del camera_state[slot_number]
+                continue
 
         for slot_number in occupied_set:
             slot_state = camera_state.get(slot_number)
