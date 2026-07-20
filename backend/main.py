@@ -80,7 +80,21 @@ CENTER_EDGE_TOLERANCE_PX = float(env_value("CENTER_EDGE_TOLERANCE_PX", "26"))
 EDGE_MIN_SLOT_OVERLAP = float(env_value("EDGE_MIN_SLOT_OVERLAP", "0.10"))
 PARKING_AUTO_LOG_SECONDS = float(env_value("PARKING_AUTO_LOG_SECONDS", "10"))
 SLOTS_REFRESH_INTERVAL = int(env_value("SLOTS_REFRESH_INTERVAL", "60"))
-STREAM_SIZE = (640, 360)
+STREAM_WIDTH = int(env_value("STREAM_WIDTH", "960"))
+STREAM_HEIGHT = int(env_value("STREAM_HEIGHT", "540"))
+STREAM_JPEG_QUALITY = int(env_value("STREAM_JPEG_QUALITY", "75"))
+PREVIEW_WIDTH = int(env_value("PREVIEW_WIDTH", "960"))
+PREVIEW_HEIGHT = int(env_value("PREVIEW_HEIGHT", "540"))
+PREVIEW_JPEG_QUALITY = int(env_value("PREVIEW_JPEG_QUALITY", "78"))
+
+STREAM_WIDTH = max(320, STREAM_WIDTH)
+STREAM_HEIGHT = max(180, STREAM_HEIGHT)
+PREVIEW_WIDTH = max(320, PREVIEW_WIDTH)
+PREVIEW_HEIGHT = max(180, PREVIEW_HEIGHT)
+STREAM_JPEG_QUALITY = max(40, min(95, STREAM_JPEG_QUALITY))
+PREVIEW_JPEG_QUALITY = max(40, min(95, PREVIEW_JPEG_QUALITY))
+STREAM_SIZE = (STREAM_WIDTH, STREAM_HEIGHT)
+PREVIEW_SIZE = (PREVIEW_WIDTH, PREVIEW_HEIGHT)
 VEHICLE_CLASS_NAMES = {"car", "bus", "truck"}
 Slot = Union[Tuple[int, int, int, int], dict[str, object]]
 
@@ -1085,7 +1099,11 @@ async def websocket_live(websocket: WebSocket):
                     "parking_exit",
                     event["slot_number"],
                 )
-            success, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+            success, buffer = cv2.imencode(
+                '.jpg',
+                annotated_frame,
+                [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY],
+            )
 
             if not success:
                 print("âš ï¸ JPEG encoding failed")
@@ -1193,8 +1211,8 @@ async def websocket_preview_camera(websocket: WebSocket):
                 await asyncio.sleep(0.01)
                 continue
 
-            preview = cv2.resize(frame, (640, 360))
-            ok, buffer = cv2.imencode('.jpg', preview, [cv2.IMWRITE_JPEG_QUALITY, 55])
+            preview = cv2.resize(frame, PREVIEW_SIZE)
+            ok, buffer = cv2.imencode('.jpg', preview, [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
             if not ok:
                 continue
 
