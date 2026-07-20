@@ -90,6 +90,7 @@ MULTI_SLOT_MIN_SCORE = float(env_value("MULTI_SLOT_MIN_SCORE", "0.58"))
 MULTI_SLOT_SCORE_RATIO = float(env_value("MULTI_SLOT_SCORE_RATIO", "0.82"))
 PARKING_AUTO_LOG_SECONDS = float(env_value("PARKING_AUTO_LOG_SECONDS", "10"))
 PARKING_EXIT_GRACE_SECONDS = float(env_value("PARKING_EXIT_GRACE_SECONDS", "2.0"))
+PARKING_ENTRY_DEBOUNCE_SECONDS = float(env_value("PARKING_ENTRY_DEBOUNCE_SECONDS", "0.6"))
 SLOTS_REFRESH_INTERVAL = int(env_value("SLOTS_REFRESH_INTERVAL", "60"))
 STREAM_WIDTH = int(env_value("STREAM_WIDTH", "960"))
 STREAM_HEIGHT = int(env_value("STREAM_HEIGHT", "540"))
@@ -656,9 +657,27 @@ def assign_occupied_slots(slots: list[Slot], vehicles: list[tuple[int, int, int,
 def draw_parking_overlay(frame, slots: list[Slot], vehicles: list[tuple[int, int, int, int]], camera_id: Optional[int] = None):
     annotated = frame.copy()
     previous_occupied_slots = last_parking_occupancy.get(camera_id, set()) if camera_id is not None else set()
-    occupied_slot_indexes = assign_occupied_slots(slots, vehicles, previous_occupied_slots)
+    detected_slot_indexes = assign_occupied_slots(slots, vehicles, previous_occupied_slots)
+
+    # remember last detected mapping (used to bias future assignments)
     if camera_id is not None:
-        last_parking_occupancy[camera_id] = set(occupied_slot_indexes)
+        last_parking_occupancy[camera_id] = set(detected_slot_indexes)
+
+    # Determine which slots should be rendered as occupied.
+    # Prefer stable 'displayed' flags from parking_state (set by update_parking_state),
+    # fallback to direct detection if no state is available.
+    occupied_slot_indexes: list[int]
+    if camera_id is not None:
+        with parking_state_lock:
+            camera_state = parking_state.get(camera_id, {})
+            if camera_state:
+                displayed = {int(num) - 1 for num, st in camera_state.items() if bool(st.get("displayed", False))}
+                occupied_slot_indexes = sorted(displayed)
+            else:
+                occupied_slot_indexes = detected_slot_indexes
+    else:
+        occupied_slot_indexes = detected_slot_indexes
+
     occupied_slots = sorted(index + 1 for index in occupied_slot_indexes)
     occupied_count = len(occupied_slots)
 
@@ -722,6 +741,34 @@ def annotate_parking_frame(
     return annotated_frame, slots, stats
 
 
+def detect_slots_and_occupied(frame, cached_slots: Optional[list[Slot]] = None, force_slot_refresh: bool = False, camera_id: Optional[int] = None):
+    """Return resized frame, slots, vehicles and detected occupied slot numbers (1-based).
+
+    This is a lightweight detection helper used by the streaming pipeline so
+    update_parking_state can be applied before drawing (to use stable displayed flags).
+    """
+    resized_frame = cv2.resize(frame, STREAM_SIZE)
+    half_precision = str(device).startswith("cuda")
+    slots = cached_slots or []
+
+    if force_slot_refresh or not slots:
+        camera_roi_defined = False
+        if camera_id is not None:
+            camera_roi_defined = get_camera_rois(camera_id) is not None
+            slots = load_camera_manual_slots(camera_id, *STREAM_SIZE)
+
+        if not slots and not camera_roi_defined:
+            slots = detect_slots(resized_frame, half_precision)
+            if not slots and USE_MANUAL_ROI_FALLBACK:
+                slots = load_manual_slots(*STREAM_SIZE)
+
+    vehicles = detect_vehicles(resized_frame, half_precision)
+    previous_occupied_slots = last_parking_occupancy.get(camera_id, set()) if camera_id is not None else set()
+    detected_slot_indexes = assign_occupied_slots(slots, vehicles, previous_occupied_slots)
+    detected_slots_1based = sorted(index + 1 for index in detected_slot_indexes)
+    return resized_frame, slots, vehicles, detected_slots_1based
+
+
 # สถานะช่องจอดแบบเรียลไทม์ใช้ติดตามระยะเวลาครอบครองและสร้างเหตุการณ์เข้า/ออก
 def update_parking_state(camera_id: int, occupied_slots: list[int]) -> tuple[list[int], list[dict[str, object]]]:
     now = time.time()
@@ -732,10 +779,12 @@ def update_parking_state(camera_id: int, occupied_slots: list[int]) -> tuple[lis
     with parking_state_lock:
         camera_state = parking_state.setdefault(camera_id, {})
 
+        # Handle slots that are no longer detected
         for slot_number in list(camera_state.keys()):
             if slot_number not in occupied_set:
                 slot_state = camera_state[slot_number]
                 last_seen = float(slot_state.get("last_seen", now))
+                # If a displayed slot has not been seen for the grace period, treat as exit
                 if now - last_seen >= PARKING_EXIT_GRACE_SECONDS:
                     was_logged = bool(slot_state.get("auto_logged", False)) or bool(slot_state.get("manual_logged", False))
                     if was_logged:
@@ -743,27 +792,45 @@ def update_parking_state(camera_id: int, occupied_slots: list[int]) -> tuple[lis
                             "slot_number": slot_number,
                             "username": slot_state.get("username"),
                         })
+                    # remove state for slot after exit
                     del camera_state[slot_number]
                 continue
 
+        # Handle currently-detected slots: maintain detected_since and 'displayed' hysteresis
         for slot_number in occupied_set:
             slot_state = camera_state.get(slot_number)
             if slot_state is None:
+                # first time detection: record detection time but do not mark displayed yet
                 camera_state[slot_number] = {
-                    "occupied_since": now,
+                    "detected_since": now,
                     "last_seen": now,
+                    "displayed": False,
+                    "display_change_time": now,
+                    "occupied_since": None,
                     "auto_logged": False,
                     "manual_logged": False,
                     "username": None,
                 }
                 continue
 
+            # update last seen
             slot_state["last_seen"] = now
-            occupied_since = float(slot_state.get("occupied_since", now))
-            auto_logged = bool(slot_state.get("auto_logged", False))
-            if not auto_logged and now - occupied_since >= PARKING_AUTO_LOG_SECONDS:
-                slot_state["auto_logged"] = True
-                auto_log_slots.append(slot_number)
+
+            # if not yet displayed, promote to displayed only after entry debounce
+            if not bool(slot_state.get("displayed", False)):
+                detected_since = float(slot_state.get("detected_since", now))
+                if now - detected_since >= PARKING_ENTRY_DEBOUNCE_SECONDS:
+                    slot_state["displayed"] = True
+                    slot_state["display_change_time"] = now
+                    # set occupied_since when the slot is considered truly occupied
+                    slot_state["occupied_since"] = now
+            else:
+                # already displayed: consider auto-log based on occupied_since
+                occupied_since = slot_state.get("occupied_since") or now
+                auto_logged = bool(slot_state.get("auto_logged", False))
+                if not auto_logged and now - float(occupied_since) >= PARKING_AUTO_LOG_SECONDS:
+                    slot_state["auto_logged"] = True
+                    auto_log_slots.append(slot_number)
 
     return auto_log_slots, exit_events
 
@@ -1234,10 +1301,16 @@ async def websocket_live(websocket: WebSocket):
             t0 = time.time()
             now = time.time()
             force_slot_refresh = not cached_slots or (now - last_slot_refresh) >= SLOTS_REFRESH_INTERVAL
-            annotated_frame, cached_slots, stats = annotate_parking_frame(frame, cached_slots, force_slot_refresh, camera_id)
+            # Run detection first and update parking state (so displayed flags are stable
+            # before we draw the overlay). detect_slots_and_occupied returns a resized
+            # frame plus detected slots/vehicles and the detected occupied slot numbers (1-based).
+            resized_frame, slots, vehicles, detected_occupied_slots = detect_slots_and_occupied(frame, cached_slots, force_slot_refresh, camera_id)
+            cached_slots = slots
             if force_slot_refresh:
                 last_slot_refresh = now
-            auto_log_slots, exit_events = update_parking_state(camera_id, stats.get("occupied_slots", []))
+            auto_log_slots, exit_events = update_parking_state(camera_id, detected_occupied_slots)
+            # draw overlay using parking_state 'displayed' where available
+            annotated_frame, stats = draw_parking_overlay(resized_frame, slots, vehicles, camera_id)
             for slot_number in auto_log_slots:
                 await asyncio.get_running_loop().run_in_executor(
                     None,
