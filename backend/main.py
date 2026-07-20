@@ -78,6 +78,9 @@ OCCUPIED_THRESHOLD = float(env_value("OCCUPIED_THRESHOLD", "0.70"))
 OCCUPIED_SLOT_THRESHOLD = float(env_value("OCCUPIED_SLOT_THRESHOLD", "0.70"))
 CENTER_EDGE_TOLERANCE_PX = float(env_value("CENTER_EDGE_TOLERANCE_PX", "26"))
 EDGE_MIN_SLOT_OVERLAP = float(env_value("EDGE_MIN_SLOT_OVERLAP", "0.10"))
+VEHICLE_FOOTPRINT_RATIO = float(env_value("VEHICLE_FOOTPRINT_RATIO", "0.38"))
+FOOTPRINT_MIN_SLOT_OVERLAP = float(env_value("FOOTPRINT_MIN_SLOT_OVERLAP", "0.14"))
+FOOTPRINT_MIN_VEHICLE_OVERLAP = float(env_value("FOOTPRINT_MIN_VEHICLE_OVERLAP", "0.24"))
 PARKING_AUTO_LOG_SECONDS = float(env_value("PARKING_AUTO_LOG_SECONDS", "10"))
 SLOTS_REFRESH_INTERVAL = int(env_value("SLOTS_REFRESH_INTERVAL", "60"))
 STREAM_WIDTH = int(env_value("STREAM_WIDTH", "960"))
@@ -93,6 +96,9 @@ PREVIEW_WIDTH = max(320, PREVIEW_WIDTH)
 PREVIEW_HEIGHT = max(180, PREVIEW_HEIGHT)
 STREAM_JPEG_QUALITY = max(40, min(95, STREAM_JPEG_QUALITY))
 PREVIEW_JPEG_QUALITY = max(40, min(95, PREVIEW_JPEG_QUALITY))
+VEHICLE_FOOTPRINT_RATIO = max(0.20, min(0.70, VEHICLE_FOOTPRINT_RATIO))
+FOOTPRINT_MIN_SLOT_OVERLAP = max(0.02, min(0.60, FOOTPRINT_MIN_SLOT_OVERLAP))
+FOOTPRINT_MIN_VEHICLE_OVERLAP = max(0.05, min(0.80, FOOTPRINT_MIN_VEHICLE_OVERLAP))
 STREAM_SIZE = (STREAM_WIDTH, STREAM_HEIGHT)
 PREVIEW_SIZE = (PREVIEW_WIDTH, PREVIEW_HEIGHT)
 VEHICLE_CLASS_NAMES = {"car", "bus", "truck"}
@@ -449,6 +455,15 @@ def vehicle_center(vehicle: tuple[int, int, int, int]) -> tuple[float, float]:
     return ((vehicle[0] + vehicle[2]) / 2.0, (vehicle[1] + vehicle[3]) / 2.0)
 
 
+def vehicle_footprint_box(vehicle: tuple[int, int, int, int], ratio: float) -> tuple[int, int, int, int]:
+    """คืนกรอบช่วงล่างของรถเพื่อแทนตำแหน่งสัมผัสพื้น (เหมาะกับมุมกล้องเฉียง/รถสูง)"""
+    x1, y1, x2, y2 = vehicle
+    h = max(1, y2 - y1)
+    footprint_h = max(1, int(round(h * ratio)))
+    fy1 = max(y1, y2 - footprint_h)
+    return (x1, fy1, x2, y2)
+
+
 def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> Optional[float]:
     polygon = slot_polygon(slot)
     slot_area = max(1.0, polygon_area(polygon))
@@ -456,28 +471,56 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
     vehicle_polygon = [(vehicle[0], vehicle[1]), (vehicle[2], vehicle[1]), (vehicle[2], vehicle[3]), (vehicle[0], vehicle[3])]
     overlap_area = convex_intersection_area(polygon, vehicle_polygon)
 
-    if overlap_area <= 0:
+    footprint = vehicle_footprint_box(vehicle, VEHICLE_FOOTPRINT_RATIO)
+    footprint_area = max(1, (footprint[2] - footprint[0]) * (footprint[3] - footprint[1]))
+    footprint_polygon = [
+        (footprint[0], footprint[1]),
+        (footprint[2], footprint[1]),
+        (footprint[2], footprint[3]),
+        (footprint[0], footprint[3]),
+    ]
+    footprint_overlap_area = convex_intersection_area(polygon, footprint_polygon)
+
+    if overlap_area <= 0 and footprint_overlap_area <= 0:
         return None
 
     vehicle_overlap_ratio = overlap_area / vehicle_area
     slot_overlap_ratio = overlap_area / slot_area
+    footprint_vehicle_overlap_ratio = footprint_overlap_area / footprint_area
+    footprint_slot_overlap_ratio = footprint_overlap_area / slot_area
     center_x, center_y = vehicle_center(vehicle)
+    bottom_center_x = (vehicle[0] + vehicle[2]) / 2.0
+    bottom_center_y = float(vehicle[3])
     contour = np.array(polygon, dtype=np.int32)
     center_distance = cv2.pointPolygonTest(contour, (center_x, center_y), True)
+    bottom_center_distance = cv2.pointPolygonTest(contour, (bottom_center_x, bottom_center_y), True)
     center_in_slot = center_distance >= 0
     center_near_edge = center_distance >= -CENTER_EDGE_TOLERANCE_PX
+    bottom_center_in_slot = bottom_center_distance >= 0
+    bottom_center_near_edge = bottom_center_distance >= -CENTER_EDGE_TOLERANCE_PX
 
     is_candidate = (
         vehicle_overlap_ratio >= OCCUPIED_THRESHOLD
         or slot_overlap_ratio >= OCCUPIED_SLOT_THRESHOLD
         or (center_in_slot and slot_overlap_ratio >= 0.05)
         or (center_near_edge and slot_overlap_ratio >= EDGE_MIN_SLOT_OVERLAP)
+        or (footprint_slot_overlap_ratio >= FOOTPRINT_MIN_SLOT_OVERLAP)
+        or (footprint_vehicle_overlap_ratio >= FOOTPRINT_MIN_VEHICLE_OVERLAP)
+        or (bottom_center_in_slot and footprint_slot_overlap_ratio >= 0.06)
+        or (bottom_center_near_edge and footprint_slot_overlap_ratio >= 0.10)
     )
 
     if not is_candidate:
         return None
 
-    return (slot_overlap_ratio * 0.65) + (vehicle_overlap_ratio * 0.35) + (0.25 if center_in_slot else 0.0)
+    return (
+        (slot_overlap_ratio * 0.35)
+        + (vehicle_overlap_ratio * 0.20)
+        + (footprint_slot_overlap_ratio * 0.35)
+        + (footprint_vehicle_overlap_ratio * 0.10)
+        + (0.18 if center_in_slot else 0.0)
+        + (0.22 if bottom_center_in_slot else 0.0)
+    )
 
 
 def assign_occupied_slots(slots: list[Slot], vehicles: list[tuple[int, int, int, int]]) -> set[int]:
