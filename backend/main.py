@@ -654,6 +654,42 @@ def assign_occupied_slots(slots: list[Slot], vehicles: list[tuple[int, int, int,
     return used_slots
 
 
+def _dedupe_vehicles(vehicles: list[tuple[int, int, int, int]], iou_threshold: float = 0.55) -> list[tuple[int, int, int, int]]:
+    """Reduce multiple overlapping vehicle detections to a single box per physical vehicle.
+
+    Greedy by area: sort boxes by area desc, keep the largest box and discard others
+    that have IoU >= threshold with it.
+    """
+    if not vehicles:
+        return []
+
+    def area(box):
+        return max(0, (box[2] - box[0])) * max(0, (box[3] - box[1]))
+
+    def iou(a, b):
+        x1 = max(a[0], b[0])
+        y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2])
+        y2 = min(a[3], b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        if inter == 0:
+            return 0.0
+        union = area(a) + area(b) - inter
+        if union <= 0:
+            return 0.0
+        return float(inter) / float(union)
+
+    boxes = list(vehicles)
+    boxes.sort(key=area, reverse=True)
+    kept: list[tuple[int, int, int, int]] = []
+    while boxes:
+        b = boxes.pop(0)
+        kept.append(b)
+        boxes = [other for other in boxes if iou(b, other) < iou_threshold]
+
+    return kept
+
+
 def draw_parking_overlay(frame, slots: list[Slot], vehicles: list[tuple[int, int, int, int]], camera_id: Optional[int] = None):
     annotated = frame.copy()
     previous_occupied_slots = last_parking_occupancy.get(camera_id, set()) if camera_id is not None else set()
@@ -763,6 +799,8 @@ def detect_slots_and_occupied(frame, cached_slots: Optional[list[Slot]] = None, 
                 slots = load_manual_slots(*STREAM_SIZE)
 
     vehicles = detect_vehicles(resized_frame, half_precision)
+    # dedupe vehicle detections to avoid multiple boxes for same car
+    vehicles = _dedupe_vehicles(vehicles, iou_threshold=0.55)
     previous_occupied_slots = last_parking_occupancy.get(camera_id, set()) if camera_id is not None else set()
     detected_slot_indexes = assign_occupied_slots(slots, vehicles, previous_occupied_slots)
     detected_slots_1based = sorted(index + 1 for index in detected_slot_indexes)
