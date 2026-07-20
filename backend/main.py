@@ -76,6 +76,8 @@ VEHICLE_CONF = float(env_value("VEHICLE_CONF", "0.25"))
 DRAW_VEHICLE_BOXES = env_value("DRAW_VEHICLE_BOXES", "false").strip().lower() in TRUE_VALUES
 OCCUPIED_THRESHOLD = float(env_value("OCCUPIED_THRESHOLD", "0.70"))
 OCCUPIED_SLOT_THRESHOLD = float(env_value("OCCUPIED_SLOT_THRESHOLD", "0.70"))
+CENTER_EDGE_TOLERANCE_PX = float(env_value("CENTER_EDGE_TOLERANCE_PX", "26"))
+EDGE_MIN_SLOT_OVERLAP = float(env_value("EDGE_MIN_SLOT_OVERLAP", "0.10"))
 PARKING_AUTO_LOG_SECONDS = float(env_value("PARKING_AUTO_LOG_SECONDS", "10"))
 SLOTS_REFRESH_INTERVAL = int(env_value("SLOTS_REFRESH_INTERVAL", "60"))
 STREAM_SIZE = (640, 360)
@@ -447,12 +449,15 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
     slot_overlap_ratio = overlap_area / slot_area
     center_x, center_y = vehicle_center(vehicle)
     contour = np.array(polygon, dtype=np.int32)
-    center_in_slot = cv2.pointPolygonTest(contour, (center_x, center_y), False) >= 0
+    center_distance = cv2.pointPolygonTest(contour, (center_x, center_y), True)
+    center_in_slot = center_distance >= 0
+    center_near_edge = center_distance >= -CENTER_EDGE_TOLERANCE_PX
 
     is_candidate = (
         vehicle_overlap_ratio >= OCCUPIED_THRESHOLD
         or slot_overlap_ratio >= OCCUPIED_SLOT_THRESHOLD
         or (center_in_slot and slot_overlap_ratio >= 0.05)
+        or (center_near_edge and slot_overlap_ratio >= EDGE_MIN_SLOT_OVERLAP)
     )
 
     if not is_candidate:
