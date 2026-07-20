@@ -184,6 +184,32 @@
       background: #fff;
       line-height: 1.35;
       color: #22324d;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .slot-item .slot-text {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1 1 auto;
+      margin-right: 8px;
+    }
+
+    .slot-item .delete-btn {
+      background: transparent;
+      border: 1px solid var(--line);
+      color: var(--red);
+      padding: 6px 8px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    .slot-item .delete-btn:hover {
+      background: rgba(220, 61, 61, 0.08);
     }
 
     .slot-item.active {
@@ -310,16 +336,35 @@
 
     function renderList() {
       slotListEl.innerHTML = '';
-      rois.forEach((roi, index) => {
+        rois.forEach((roi, index) => {
         const item = document.createElement('div');
         item.className = 'slot-item';
-        item.textContent = `${index + 1}: ${roi.points.map(point => `[${point[0]},${point[1]}]`).join(' ')}`;
+        const text = document.createElement('div');
+        text.className = 'slot-text';
+        text.textContent = `${index + 1}: ${roi.points.map(point => `[${point[0]},${point[1]}]`).join(' ')}`;
+
+        const del = document.createElement('button');
+        del.className = 'delete-btn';
+        del.textContent = 'Delete';
+        del.title = `Delete slot ${index + 1}`;
+        del.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (!confirm(`Delete slot ${index + 1}?`)) return;
+          rois.splice(index, 1);
+          redraw();
+        });
+
+        item.appendChild(text);
+        item.appendChild(del);
         slotListEl.appendChild(item);
       });
       if (current.length) {
         const item = document.createElement('div');
         item.className = 'slot-item active';
-        item.textContent = `New: ${current.map(point => `[${point[0]},${point[1]}]`).join(' ')}`;
+        const text = document.createElement('div');
+        text.className = 'slot-text';
+        text.textContent = `New: ${current.map(point => `[${point[0]},${point[1]}]`).join(' ')}`;
+        item.appendChild(text);
         slotListEl.appendChild(item);
       }
     }
