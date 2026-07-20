@@ -628,38 +628,25 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
 
 
 def assign_occupied_slots(slots: list[Slot], vehicles: list[tuple[int, int, int, int]]) -> set[int]:
-    """จับคู่รถกับช่อง โดยให้รถค่อม 2 ช่องนับได้สูงสุด 2 ช่องถ้าคะแนนสูงพอ"""
-    occupied_slots: set[int] = set()
-
-    for vehicle_idx, vehicle in enumerate(vehicles):
-        scored_slots: list[tuple[float, int]] = []
-        for slot_idx, slot in enumerate(slots):
+    """จับคู่รถแต่ละคันได้สูงสุดหนึ่งช่อง เพื่อกันรถคันเดียวลากแดงหลายช่อง"""
+    candidates: list[tuple[float, int, int]] = []
+    for slot_idx, slot in enumerate(slots):
+        for vehicle_idx, vehicle in enumerate(vehicles):
             score = slot_vehicle_match_score(slot, vehicle)
             if score is not None:
-                scored_slots.append((score, slot_idx))
+                candidates.append((score, slot_idx, vehicle_idx))
 
-        if not scored_slots:
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    used_slots: set[int] = set()
+    used_vehicles: set[int] = set()
+
+    for _, slot_idx, vehicle_idx in candidates:
+        if slot_idx in used_slots or vehicle_idx in used_vehicles:
             continue
+        used_slots.add(slot_idx)
+        used_vehicles.add(vehicle_idx)
 
-        scored_slots.sort(reverse=True, key=lambda item: item[0])
-        best_score = scored_slots[0][0]
-        slot_limit = 2 if best_score >= MULTI_SLOT_MIN_SCORE else 1
-        best_slot_idx = scored_slots[0][1]
-
-        picked = 0
-        for score, slot_idx in scored_slots:
-            if score < MULTI_SLOT_MIN_SCORE:
-                continue
-            if score < best_score * MULTI_SLOT_SCORE_RATIO:
-                continue
-            if picked > 0 and not slots_are_neighbors(slots[best_slot_idx], slots[slot_idx]):
-                continue
-            occupied_slots.add(slot_idx)
-            picked += 1
-            if picked >= slot_limit:
-                break
-
-    return occupied_slots
+    return used_slots
 
 
 def draw_parking_overlay(frame, slots: list[Slot], vehicles: list[tuple[int, int, int, int]]):
