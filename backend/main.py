@@ -86,6 +86,8 @@ BASE_BAND_MIN_SLOT_OVERLAP = float(env_value("BASE_BAND_MIN_SLOT_OVERLAP", "0.05
 BASE_BAND_MIN_VEHICLE_OVERLAP = float(env_value("BASE_BAND_MIN_VEHICLE_OVERLAP", "0.14"))
 FAR_ZONE_Y_RATIO = float(env_value("FAR_ZONE_Y_RATIO", "0.46"))
 FAR_THRESHOLD_SCALE = float(env_value("FAR_THRESHOLD_SCALE", "0.72"))
+MULTI_SLOT_MIN_SCORE = float(env_value("MULTI_SLOT_MIN_SCORE", "0.58"))
+MULTI_SLOT_SCORE_RATIO = float(env_value("MULTI_SLOT_SCORE_RATIO", "0.82"))
 PARKING_AUTO_LOG_SECONDS = float(env_value("PARKING_AUTO_LOG_SECONDS", "10"))
 SLOTS_REFRESH_INTERVAL = int(env_value("SLOTS_REFRESH_INTERVAL", "60"))
 STREAM_WIDTH = int(env_value("STREAM_WIDTH", "960"))
@@ -109,6 +111,8 @@ BASE_BAND_MIN_SLOT_OVERLAP = max(0.01, min(0.50, BASE_BAND_MIN_SLOT_OVERLAP))
 BASE_BAND_MIN_VEHICLE_OVERLAP = max(0.05, min(0.60, BASE_BAND_MIN_VEHICLE_OVERLAP))
 FAR_ZONE_Y_RATIO = max(0.10, min(0.90, FAR_ZONE_Y_RATIO))
 FAR_THRESHOLD_SCALE = max(0.45, min(1.00, FAR_THRESHOLD_SCALE))
+MULTI_SLOT_MIN_SCORE = max(0.20, min(1.50, MULTI_SLOT_MIN_SCORE))
+MULTI_SLOT_SCORE_RATIO = max(0.50, min(0.98, MULTI_SLOT_SCORE_RATIO))
 STREAM_SIZE = (STREAM_WIDTH, STREAM_HEIGHT)
 PREVIEW_SIZE = (PREVIEW_WIDTH, PREVIEW_HEIGHT)
 VEHICLE_CLASS_NAMES = {"car", "bus", "truck"}
@@ -602,25 +606,35 @@ def slot_vehicle_match_score(slot: Slot, vehicle: tuple[int, int, int, int]) -> 
 
 
 def assign_occupied_slots(slots: list[Slot], vehicles: list[tuple[int, int, int, int]]) -> set[int]:
-    """จับคู่รถแต่ละคันได้สูงสุดหนึ่งช่อง เพื่อกันการนับรถคันเดียวซ้ำหลายช่อง"""
-    candidates: list[tuple[float, int, int]] = []
-    for slot_idx, slot in enumerate(slots):
-        for vehicle_idx, vehicle in enumerate(vehicles):
+    """จับคู่รถกับช่อง โดยให้รถค่อม 2 ช่องนับได้สูงสุด 2 ช่องถ้าคะแนนสูงพอ"""
+    occupied_slots: set[int] = set()
+
+    for vehicle_idx, vehicle in enumerate(vehicles):
+        scored_slots: list[tuple[float, int]] = []
+        for slot_idx, slot in enumerate(slots):
             score = slot_vehicle_match_score(slot, vehicle)
             if score is not None:
-                candidates.append((score, slot_idx, vehicle_idx))
+                scored_slots.append((score, slot_idx))
 
-    candidates.sort(reverse=True, key=lambda item: item[0])
-    used_slots: set[int] = set()
-    used_vehicles: set[int] = set()
-
-    for _, slot_idx, vehicle_idx in candidates:
-        if slot_idx in used_slots or vehicle_idx in used_vehicles:
+        if not scored_slots:
             continue
-        used_slots.add(slot_idx)
-        used_vehicles.add(vehicle_idx)
 
-    return used_slots
+        scored_slots.sort(reverse=True, key=lambda item: item[0])
+        best_score = scored_slots[0][0]
+        slot_limit = 2 if best_score >= MULTI_SLOT_MIN_SCORE else 1
+
+        picked = 0
+        for score, slot_idx in scored_slots:
+            if score < MULTI_SLOT_MIN_SCORE:
+                continue
+            if score < best_score * MULTI_SLOT_SCORE_RATIO:
+                continue
+            occupied_slots.add(slot_idx)
+            picked += 1
+            if picked >= slot_limit:
+                break
+
+    return occupied_slots
 
 
 def draw_parking_overlay(frame, slots: list[Slot], vehicles: list[tuple[int, int, int, int]]):
